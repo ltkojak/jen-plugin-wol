@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Wake{% endblock %}
+{% block content %}
+
+<div class="page-header flex items-center between wrap gap-3">
+    <div>
+        <h1>{{ icon("zap", "ico-lg") }} Wake</h1>
+        <p>Wake-on-LAN favourites — send a magic packet to any host below, or use the "Wake" action on a Lease, Reservation, or Device row.</p>
+    </div>
+    {% if is_admin %}
+    <button id="wol-add-btn" class="btn btn-primary">{{ icon("plus") }} Add Favourite</button>
+    {% endif %}
+</div>
+
+{% if ipv6_enabled %}
+<div class="alert alert-info">{{ icon("info") }} Wake & Actions targets IPv4 addresses only.</div>
+{% endif %}
+
+<div class="card" style="padding:0;">
+<div class="table-wrap">
+<table class="rowlist">
+    <thead><tr>
+        <th>Favourite</th>
+        <th>Subnet</th>
+        <th>SecureOn</th>
+        <th>Last woken</th>
+        <th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+    <tr>
+        <td data-m="primary">
+            {{ r.label or r.mac }}
+            {% if r.label %}<span class="small muted mono">({{ r.mac }})</span>{% endif %}
+        </td>
+        <td data-m="hide">{{ r.subnet_name }}</td>
+        <td data-m="hide">{{ icon("shield") if r.has_secureon else '—' }}</td>
+        <td class="small muted" data-m="hide">
+            {% if r.last_woken_at %}{{ r.last_woken_at | utcfmt }}{% if r.last_woken_by %} by {{ r.last_woken_by }}{% endif %}{% else %}never{% endif %}
+        </td>
+        <td data-m="trailing">
+            <div class="flex gap-1 items-center">
+                {% if is_admin %}
+                <form method="POST" action="{{ url_for('wol.wake_favourite', host_id=r.id) }}" class="contents"
+                      data-confirm="Send a wake packet to {{ r.label or r.mac }}?">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-primary" title="Wake" aria-label="Wake">{{ icon("zap") }}</button>
+                </form>
+                <form method="POST" action="{{ url_for('wol.delete_favourite', host_id=r.id) }}" class="contents"
+                      data-confirm="Remove {{ r.label or r.mac }} from favourites?">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-secondary bad" title="Delete" aria-label="Delete">{{ icon("trash") }}</button>
+                </form>
+                {% endif %}
+            </div>
+        </td>
+    </tr>
+    {% endfor %}
+    {% if not rows %}
+    <tr><td data-m="full" colspan="5" class="center muted">No favourites yet. {% if is_admin %}Add one above, or use the "Wake" action on any Lease, Reservation, or Device row.{% endif %}</td></tr>
+    {% endif %}
+    </tbody>
+</table>
+</div>
+</div>
+
+{% if is_admin %}
+<div id="wol-add-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
+<div class="card" style="width:min(440px,94vw);max-height:90vh;overflow-y:auto;">
+    <div class="flex between items-center mb-3">
+        <h3>{{ icon("plus") }} Add Favourite</h3>
+        <button id="wol-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
+    </div>
+    <form method="POST" action="{{ url_for('wol.add_favourite') }}" id="wol-add-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group">
+            <label>MAC address</label>
+            <input type="text" name="mac" id="wol-mac" list="wol-candidates" class="mono" placeholder="aa:bb:cc:dd:ee:ff" required autocomplete="off">
+            <datalist id="wol-candidates">
+                {% for c in candidates %}
+                <option value="{{ c.mac }}">{{ c.label or c.mac }}</option>
+                {% endfor %}
+            </datalist>
+        </div>
+        <div class="form-group">
+            <label>Label <span class="small muted">(optional)</span></label>
+            <input type="text" name="label" id="wol-label" maxlength="100" autocomplete="off">
+        </div>
+        <div class="form-group">
+            <label>IP <span class="small muted">(optional — used to work out the subnet)</span></label>
+            <input type="text" name="ip" id="wol-ip" class="mono" autocomplete="off">
+        </div>
+        <div class="form-group">
+            <label>SecureOn password <span class="small muted">(optional)</span></label>
+            <input type="text" name="secureon" class="mono" placeholder="aa:bb:cc:dd" autocomplete="off">
+        </div>
+        <div class="flex gap-2 mt-3">
+            <button type="submit" class="btn btn-primary">Add Favourite</button>
+            <button type="button" id="wol-add-cancel-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+    </form>
+</div>
+</div>
+{% endif %}
+
+<script nonce="{{ csp_nonce }}">
+function _wolModal(id, show) {
+    document.getElementById(id).style.display = show ? 'flex' : 'none';
+}
+{% if is_admin %}
+var WOL_CANDIDATES = {{ candidates|tojson }};
+document.getElementById('wol-add-btn').addEventListener('click', function() { _wolModal('wol-add-modal', true); });
+document.getElementById('wol-add-close-btn').addEventListener('click', function() { _wolModal('wol-add-modal', false); });
+document.getElementById('wol-add-cancel-btn').addEventListener('click', function() { _wolModal('wol-add-modal', false); });
+document.getElementById('wol-add-modal').addEventListener('click', function(e) { if (e.target === this) _wolModal('wol-add-modal', false); });
+document.getElementById('wol-mac').addEventListener('input', function() {
+    var match = WOL_CANDIDATES.find(function(c) { return c.mac === this.value; }.bind(this));
+    if (!match) return;
+    var labelField = document.getElementById('wol-label');
+    if (!labelField.value) labelField.value = match.label || '';
+    document.getElementById('wol-ip').value = match.ip || '';
+});
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') _wolModal('wol-add-modal', false);
+});
+{% endif %}
+</script>
+
+{% endblock %}
