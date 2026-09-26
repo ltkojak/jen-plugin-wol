@@ -1,5 +1,25 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.0.2] - 2026-09-25
+
+Requires Jen 5.65.6 or later (`client_subnet_for_mac` in the plugin API). Adds one migration (the `secureon` column becomes `TEXT` so it can hold the encrypted form); it runs by itself on the next start.
+
+### Fixed: the SecureOn password was stored in clear
+
+Every other plugin credential is stored with Jen's `encrypt_secret`; a favourite's SecureOn password was inserted exactly as typed. It is now encrypted on write, and never shown again (the page has only ever shown whether one is set). A favourite saved by 1.0.0 or 1.0.1 still wakes: a stored value that is not in Jen's encrypted format is accepted as the legacy plain value it is, and is re-encrypted in place the first time it is used. A stored value that cannot be decrypted (a restored database with a different key) refuses the wake with a plain message instead of sending a packet without the password.
+
+### Changed: one place decides which subnet a MAC is in
+
+The plugin carried its own lookup (a lease, then a reservation); Jen now offers one precedence to every plugin, `client_subnet_for_mac` (current lease, then reservation, then the device's last known subnet), and this plugin uses it. The device fallback means a MAC Jen only knows from its devices table now has a subnet to be judged on.
+
+### Fixed: raw exception text on the page
+
+A failed send, add, or remove put the exception's own text into the page. The details go to Jen's log and the page shows a generic message.
+
+### Changed
+
+- `tools/test_plugin.py` covers the SecureOn round trip, the legacy read and re-encrypt, an undecryptable value, and the failed-send message.
+
 ## [1.0.1] - 2026-09-25
 
 Requires Jen 5.65.2 or later (the `can_access_subnet` and `api_key_can_access_subnet` helpers in the plugin API).

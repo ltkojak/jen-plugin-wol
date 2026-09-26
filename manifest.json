@@ -1,10 +1,10 @@
 {
   "id": "wol",
   "name": "Wake & Actions",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Wake-on-LAN from any lease, reservation, or device row, plus a favourites list for the hosts you wake often. Sends a standard magic packet (with optional SecureOn password) to both the subnet's directed broadcast and 255.255.255.255.",
   "author": "Matthew Thibodeau",
-  "requires_jen": "5.65.2",
+  "requires_jen": "5.65.6",
   "plugin_api": 3,
   "tags": [
     "network",
@@ -20,6 +20,7 @@
     }
   ],
   "db_migrations": [
-    {"version": 1, "description": "wol_hosts table", "sql": "CREATE TABLE IF NOT EXISTS wol_hosts (id INT AUTO_INCREMENT PRIMARY KEY, mac VARCHAR(17) NOT NULL UNIQUE, ip VARCHAR(15) NULL, subnet_id INT NULL, label VARCHAR(100), secureon VARCHAR(23) NULL, last_woken_at DATETIME NULL, last_woken_by VARCHAR(100) NULL)"}
+    {"version": 1, "description": "wol_hosts table", "sql": "CREATE TABLE IF NOT EXISTS wol_hosts (id INT AUTO_INCREMENT PRIMARY KEY, mac VARCHAR(17) NOT NULL UNIQUE, ip VARCHAR(15) NULL, subnet_id INT NULL, label VARCHAR(100), secureon VARCHAR(23) NULL, last_woken_at DATETIME NULL, last_woken_by VARCHAR(100) NULL)"},
+    {"version": 2, "description": "wol_hosts: secureon widened to TEXT so it can hold the encrypted form", "sql": "ALTER TABLE wol_hosts MODIFY COLUMN secureon TEXT NULL"}
   ]
 }

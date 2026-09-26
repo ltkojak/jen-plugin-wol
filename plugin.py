@@ -91,6 +91,15 @@ def parse_secureon(raw):
     return bytes.fromhex(cleaned), None
 
 
+_ENCRYPTED_PREFIX = "v1:"
+
+
+def is_encrypted_secureon(stored):
+    """Pure: is a stored SecureOn value in Jen's encrypted format (`v1:...`)? Anything else is a
+    legacy value from 1.0.0 and 1.0.1, which stored the password exactly as typed."""
+    return bool(stored) and str(stored).startswith(_ENCRYPTED_PREFIX)
+
+
 def build_magic_packet(mac, secureon=None):
     """Pure: the Wake-on-LAN magic packet for `mac` — 6×0xFF + 16×MAC
     (102 bytes) — with `secureon` (raw bytes, already parsed) appended
@@ -203,31 +212,12 @@ def _derive_subnet_id(ip, subnet_map):
 
 
 def _current_subnet_for_mac(mac):
-    """The MAC's current subnet — a lease first, then a reservation
-    (global reservations carry no useful subnet_id, so fall through),
-    matching how the rest of Jen judges "where is this client now"."""
-    hex_mac = mac.replace(":", "").upper()
-    kdb = None
-    try:
-        kdb = _get_kea_db()
-        with kdb.cursor() as cur:
-            cur.execute("SELECT subnet_id FROM lease4 WHERE HEX(hwaddr)=%s AND state=0", (hex_mac,))
-            row = cur.fetchone()
-            if row:
-                return row["subnet_id"]
-            cur.execute(
-                "SELECT dhcp4_subnet_id AS subnet_id FROM hosts WHERE dhcp_identifier_type=0 AND HEX(dhcp_identifier)=%s",
-                (hex_mac,),
-            )
-            row = cur.fetchone()
-            if row and row["subnet_id"]:
-                return row["subnet_id"]
-    except Exception as e:
-        logger.warning(f"Wake & Actions: lease/reservation subnet lookup failed: {e}")
-    finally:
-        if kdb:
-            kdb.close()
-    return None
+    """The MAC's current subnet by Jen's ONE precedence (current lease, then reservation, then the
+    device's last known subnet, else None): `plugin_api.client_subnet_for_mac`, v5.65.6. This plugin
+    used to carry a private lookup (lease, then reservation only)."""
+    from jen.plugin_api import client_subnet_for_mac
+
+    return client_subnet_for_mac(mac)
 
 
 def _wake_subject(mac):
@@ -282,25 +272,69 @@ def _send_wake(mac, subnet_cidr, secureon):
         sock.close()
 
 
+def _decode_secureon(stored):
+    """(plain, error) for a stored SecureOn value: decrypted when it is in Jen's encrypted format, taken
+    as-is when it is a legacy plain value (which the next use re-encrypts, see _wake_mac)."""
+    if not is_encrypted_secureon(stored):
+        return stored, None
+    try:
+        from jen.plugin_api import decrypt_secret
+
+        return decrypt_secret(stored), None
+    except Exception as e:
+        logger.error(f"Wake & Actions: could not decrypt a stored SecureOn password: {e}")
+        return None, "The saved SecureOn password could not be decrypted; enter it again."
+
+
+def _reencrypt_legacy_secureon(mac, plain):
+    """A pre-1.0.2 favourite kept its SecureOn password in clear: encrypt it in place the first time it
+    is used. Best effort - the wake has already been sent."""
+    db = None
+    try:
+        from jen.plugin_api import encrypt_secret
+
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE wol_hosts SET secureon=%s WHERE mac=%s AND secureon=%s",
+                (encrypt_secret(plain), mac, plain),
+            )
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Wake & Actions: could not re-encrypt a legacy SecureOn password for {mac}: {e}")
+    finally:
+        if db:
+            db.close()
+
+
 def _wake_mac(mac, subnet_id, secureon_raw, actor):
     """The shared impure core behind every wake entry point: rate
-    limit, build+send, audit, emit. Returns (ok, error_message)."""
+    limit, build+send, audit, emit. Returns (ok, error_message).
+    `secureon_raw` is the value as STORED (encrypted, or a legacy plain one)."""
     now = time.monotonic()
     global _last_sent
     _last_sent = prune_rate_map(_last_sent, now)
     if rate_limited(_last_sent.get(mac), now):
         return False, "Wake packet already sent for this MAC in the last 5 seconds."
-    secureon = None
+    secureon, legacy_plain = None, None
     if secureon_raw:
-        secureon, err = parse_secureon(secureon_raw)
+        plain, err = _decode_secureon(secureon_raw)
         if err:
             return False, err
+        secureon, err = parse_secureon(plain)
+        if err:
+            return False, err
+        if not is_encrypted_secureon(secureon_raw):
+            legacy_plain = secureon_raw
     cidr = _subnet_map().get(subnet_id, {}).get("cidr") if subnet_id is not None else None
     try:
         _send_wake(mac, cidr, secureon)
     except Exception as e:
-        return False, str(e)[:200]
+        logger.error(f"Wake & Actions: could not send the wake packet for {mac}: {e}")
+        return False, "Could not send the wake packet; the details are in Jen's log."
     _last_sent[mac] = now
+    if legacy_plain:
+        _reencrypt_legacy_secureon(mac, legacy_plain)
     db = None
     try:
         db = _get_db()
@@ -423,7 +457,9 @@ def add_favourite():
         if err:
             flash(err, "error")
             return redirect(url_for("wol.index"))
-        secureon = secureon_raw
+        from jen.plugin_api import encrypt_secret
+
+        secureon = encrypt_secret(secureon_raw)  # encrypted at rest, like every other plugin credential
 
     db = None
     try:
@@ -439,7 +475,8 @@ def add_favourite():
         flash(f"{label or mac} added to favourites.", "success")
         _audit("WOL_ADD_FAVOURITE", mac, f"label={label}")
     except Exception as e:
-        flash(f"Could not add favourite: {e}", "error")
+        logger.error(f"Wake & Actions: could not add favourite: {e}")
+        flash("Could not add the favourite; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -465,7 +502,8 @@ def delete_favourite(host_id):
         flash("Favourite removed.", "success")
         _audit("WOL_DELETE_FAVOURITE", str(host_id), "favourite removed")
     except Exception as e:
-        flash(f"Could not remove favourite: {e}", "error")
+        logger.error(f"Wake & Actions: could not remove favourite: {e}")
+        flash("Could not remove the favourite; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()

@@ -6,7 +6,7 @@ Wake-on-LAN from any Lease, Reservation, or Device row in [Jen](https://github.c
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.65.2 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.6 or later
 
 ## How a wake packet is sent
 
@@ -15,7 +15,7 @@ A standard 102-byte Wake-on-LAN magic packet (six `0xFF` bytes, then the target 
 ## Features
 
 - **Wake** row action on Lease, Reservation, and Device rows — sends a packet with one click and a confirmation naming the actual MAC
-- **Favourites** page (nav Management → Wake): save a MAC (with an optional label, an IP to show on the row, and a SecureOn password that a blank re-add keeps), wake it with one click, see when it was last woken and by whom
+- **Favourites** page (nav Management → Wake): save a MAC (with an optional label, an IP to show on the row, and a SecureOn password that a blank re-add keeps; the password is stored encrypted and never shown again), wake it with one click, see when it was last woken and by whom
 - **Rate-limited**: at most one wake packet per MAC every 5 seconds, whichever entry point sent it
 - Every wake is audited (`WOL_SENT`) and emits a `plugin.wol.sent` event
 - **JSON API**: `POST /api/v1/plugins/wol/wake` `{"mac": "..."}` (write key), scoped to the calling key's accessible subnets

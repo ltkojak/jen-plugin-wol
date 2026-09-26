@@ -357,6 +357,88 @@ def main():
         "_wake_mac: a wake evicts long-dead rate entries and records the new one",
     )
 
+    # ── 1.0.2: the SecureOn password is encrypted at rest ────────────────────
+    check(p.is_encrypted_secureon("v1:gAAAA") is True, "is_encrypted_secureon: Jen's v1: format")
+    check(
+        p.is_encrypted_secureon("aa:bb:cc:dd") is False
+        and p.is_encrypted_secureon("") is False
+        and p.is_encrypted_secureon(None) is False,
+        "is_encrypted_secureon: a legacy plain value, blank and None are not",
+    )
+    jen_api = types.ModuleType("jen.plugin_api")
+    jen_api.encrypt_secret = lambda s: "v1:" + s[::-1]  # a stand-in with the same shape: reversible, prefixed
+    jen_api.decrypt_secret = lambda s: s[3:][::-1]
+    sys.modules["jen"] = types.ModuleType("jen")
+    sys.modules["jen.plugin_api"] = jen_api
+    sys.modules["jen"].plugin_api = jen_api
+    p._can = everything
+    p._current_subnet_for_mac = lambda mac: 1
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}}
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    p.request = types.SimpleNamespace(
+        form={"mac": "aa:bb:cc:dd:ee:01", "label": "x", "secureon": "aa:bb:cc:dd"}, args={}
+    )
+    p.add_favourite()
+    ins = [s for s in fdb.statements if s[0] == "INSERT"]
+    check(
+        len(ins) == 1 and ins[0][2][4] == "v1:" + "aa:bb:cc:dd"[::-1],
+        "add_favourite: the SecureOn value stored is the ENCRYPTED form, never what was typed",
+    )
+    check(ins[0][2][4] != "aa:bb:cc:dd", "add_favourite: the plain text is not what reaches the database")
+    # round trip: what add stored is what a wake decodes and sends
+    stored = ins[0][2][4]
+    sent.clear()
+    p._last_sent.clear()
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    ok, err = p._wake_mac("aa:bb:cc:dd:ee:01", 1, stored, "tester")
+    check(
+        ok and len(sent) == 1 and sent[0][2] == bytes.fromhex("aabbccdd"),
+        f"_wake_mac: an encrypted SecureOn round-trips to the 4 bytes that are sent (got {sent})",
+    )
+    check(
+        not any(s[0] == "UPDATE" and "secureon" in s[1] for s in fdb.statements),
+        "_wake_mac: an already-encrypted value is not rewritten",
+    )
+    # legacy: a plain value from 1.0.0/1.0.1 is accepted and re-encrypted on use
+    sent.clear()
+    p._last_sent.clear()
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    ok, err = p._wake_mac("aa:bb:cc:dd:ee:01", 1, "aa:bb:cc:dd", "tester")
+    check(ok and sent[0][2] == bytes.fromhex("aabbccdd"), "_wake_mac: a legacy plain SecureOn value is still accepted")
+    re_enc = [s for s in fdb.statements if s[0] == "UPDATE" and "secureon=%s" in s[1]]
+    check(
+        len(re_enc) == 1 and re_enc[0][2][0].startswith("v1:") and re_enc[0][2][2] == "aa:bb:cc:dd",
+        "_wake_mac: ...and re-encrypted in place the first time it is used",
+    )
+    # a stored value that cannot be decrypted is a clear refusal, not a wake with no password
+    jen_api.decrypt_secret = lambda s: (_ for _ in ()).throw(RuntimeError("wrong key marker-xyz"))
+    sent.clear()
+    p._last_sent.clear()
+    ok, err = p._wake_mac("aa:bb:cc:dd:ee:01", 1, "v1:zzz", "tester")
+    check(
+        not ok and not sent and "marker-xyz" not in err,
+        f"_wake_mac: an undecryptable SecureOn refuses the wake without leaking the exception (got {err!r})",
+    )
+    jen_api.decrypt_secret = lambda s: s[3:][::-1]
+
+    # ── 1.0.2: the subnet comes from Jen's ONE precedence ────────────────────
+    jen_api.client_subnet_for_mac = lambda mac: {"aa:bb:cc:dd:ee:09": 4}.get(mac)
+    fresh = load_plugin()
+    check(
+        fresh._current_subnet_for_mac("aa:bb:cc:dd:ee:09") == 4
+        and fresh._current_subnet_for_mac("aa:bb:cc:dd:ee:10") is None,
+        "_current_subnet_for_mac: answered by plugin_api.client_subnet_for_mac, not a private copy",
+    )
+
+    # ── 1.0.2: a failed send does not put the exception text on the page ─────
+    p._last_sent.clear()
+    p._send_wake = lambda mac, cidr, secureon: (_ for _ in ()).throw(OSError("Network is unreachable marker-xyz"))
+    ok, err = p._wake_mac("aa:bb:cc:dd:ee:01", 1, None, "tester")
+    check(not ok and "marker-xyz" not in err, f"_wake_mac: a socket failure returns a generic message (got {err!r})")
+
     # ── register(): actually runs end to end against a stub jen.plugin_api ──
     row_action_calls = _stub_jen_plugin_api()
     try:
