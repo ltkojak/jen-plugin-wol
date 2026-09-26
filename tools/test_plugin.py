@@ -176,6 +176,187 @@ def main():
     p.current_user.role = "admin"
     check(p._is_admin() is True, "admin role restored for the rest of the run")
 
+    # ── 1.0.1: the rate-limit map stays bounded ──────────────────────────────
+    stale = {"aa:aa:aa:aa:aa:01": 10.0, "aa:aa:aa:aa:aa:02": 95.0, "aa:aa:aa:aa:aa:03": 100.0}
+    pruned = p.prune_rate_map(stale, 100.0)
+    check(
+        set(pruned) == {"aa:aa:aa:aa:aa:02", "aa:aa:aa:aa:aa:03"},
+        f"prune_rate_map: an entry older than a minute is dropped, recent ones kept (got {sorted(pruned)})",
+    )
+    check(p.prune_rate_map({}, 1.0) == {}, "prune_rate_map: an empty map stays empty")
+
+    # ── a fake database and request, to run the impure routes ────────────────
+    class FakeDB:
+        def __init__(self, selects=None):
+            self.statements = []
+            self.selects = list(selects or [])
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql.split()[0].upper(), sql, params))
+
+        def fetchone(self):
+            return self.selects.pop(0) if self.selects else None
+
+        def fetchall(self):
+            return self.selects.pop(0) if self.selects else []
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+        def kinds(self):
+            return [s[0] for s in self.statements]
+
+    only_one = lambda sid: sid == 1  # noqa: E731 - a subnet-restricted caller: subnet 1; None is not theirs
+    everything = lambda sid: True  # noqa: E731 - an unrestricted caller
+    flashed, sent = [], []
+    p.flash = lambda msg, cat="message": flashed.append(msg)
+    p.redirect = lambda where: "redirect"
+    p.url_for = lambda *a, **k: "/x"
+    p.jsonify = lambda payload: payload
+    p._require_write = lambda: True
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    p._send_wake = lambda mac, cidr, secureon: sent.append((mac, cidr, secureon))
+    mac_subnet = {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}  # a MAC Jen has never seen is absent
+    p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
+
+    # ── 1.0.1: a wake from a row is judged on the MAC's own subnet ───────────
+    p._can = only_one
+    for label, mac, hint in (
+        ("a MAC in subnet 2, the query string naming subnet 1", "aa:bb:cc:dd:ee:02", "1"),
+        ("a MAC Jen has never seen, the query string naming subnet 1", "aa:bb:cc:dd:ee:99", "1"),
+    ):
+        sent.clear()
+        p._last_sent.clear()
+        p._get_db = lambda: FakeDB([None])  # no favourite row
+        p.request = types.SimpleNamespace(args={"mac": mac, "subnet_id": hint, "ip": "10.1.0.5"})
+        p.wake_from_row()
+        check(sent == [], f"wake_from_row: {label} sends nothing")
+    sent.clear()
+    p._last_sent.clear()
+    p._get_db = lambda: FakeDB([None, None])
+    p.request = types.SimpleNamespace(args={"mac": "aa:bb:cc:dd:ee:01", "subnet_id": "2"})
+    p.wake_from_row()
+    check(
+        sent == [("aa:bb:cc:dd:ee:01", "10.1.0.0/24", None)],
+        f"wake_from_row: a MAC in the caller's subnet is woken on ITS subnet, not the one named in the URL (got {sent})",
+    )
+    # a MAC with no lease or reservation falls back to its favourite's stored subnet
+    sent.clear()
+    p._last_sent.clear()
+    p._get_db = lambda: FakeDB([{"subnet_id": 1, "secureon": "aa:bb:cc:dd"}, None])
+    p.request = types.SimpleNamespace(args={"mac": "aa:bb:cc:dd:ee:99"})
+    p.wake_from_row()
+    check(
+        len(sent) == 1 and sent[0][1] == "10.1.0.0/24",
+        "wake_from_row: a MAC with no lease uses its favourite's stored subnet",
+    )
+    sent.clear()
+    p._last_sent.clear()
+    p._can = everything
+    p._get_db = lambda: FakeDB([None, None])
+    p.request = types.SimpleNamespace(args={"mac": "aa:bb:cc:dd:ee:99"})
+    p.wake_from_row()
+    check(len(sent) == 1, "wake_from_row: an unrestricted caller may wake a MAC with no subnet")
+
+    # ── 1.0.1: adding a favourite takes the subnet from the MAC, keeps SecureOn ─
+    p._can = only_one
+    for label, mac, ip in (
+        ("a MAC in subnet 2, an address typed in subnet 1", "aa:bb:cc:dd:ee:02", "10.1.0.9"),
+        ("a MAC Jen has never seen, an address typed in subnet 1", "aa:bb:cc:dd:ee:99", "10.1.0.9"),
+    ):
+        fdb = FakeDB()
+        p._get_db = lambda fdb=fdb: fdb
+        p.request = types.SimpleNamespace(form={"mac": mac, "ip": ip, "label": "x", "secureon": ""})
+        p.add_favourite()
+        check(fdb.statements == [], f"add_favourite: {label} is refused, nothing stored")
+    fdb = FakeDB()
+    p._get_db = lambda fdb=fdb: fdb
+    p.request = types.SimpleNamespace(form={"mac": "aa:bb:cc:dd:ee:01", "ip": "10.2.0.9", "label": "x", "secureon": ""})
+    p.add_favourite()
+    insert = [s for s in fdb.statements if s[0] == "INSERT"]
+    check(
+        len(insert) == 1 and insert[0][2] == ("aa:bb:cc:dd:ee:01", None, 1, "x", None),
+        f"add_favourite: the subnet is the MAC's (1); an address in another subnet is not stored (got {insert and insert[0][2]})",
+    )
+    check(
+        "IF(VALUES(secureon) IS NULL, secureon, VALUES(secureon))" in insert[0][1],
+        "add_favourite: a blank SecureOn on a re-add keeps the stored one",
+    )
+
+    # ── 1.0.1: a favourite is judged on its own row ──────────────────────────
+    p._can = only_one
+    fdb = FakeDB([{"subnet_id": 2}])
+    p._get_db = lambda fdb=fdb: fdb
+    p.delete_favourite(5)
+    check(
+        "DELETE" not in fdb.kinds() and flashed[-1] == "Favourite not found.",
+        "delete_favourite: a favourite in subnet 2 reads as not found to a caller scoped to subnet 1",
+    )
+    fdb = FakeDB([{"subnet_id": None}])
+    p._get_db = lambda fdb=fdb: fdb
+    p.delete_favourite(5)
+    check("DELETE" not in fdb.kinds(), "delete_favourite: a favourite with no subnet is not a scoped caller's")
+    fdb = FakeDB([{"subnet_id": 1}])
+    p._get_db = lambda fdb=fdb: fdb
+    p.delete_favourite(5)
+    check("DELETE" in fdb.kinds(), "delete_favourite: a favourite in the caller's own subnet is theirs to remove")
+    p._can = everything
+    fdb = FakeDB([{"subnet_id": None}])
+    p._get_db = lambda fdb=fdb: fdb
+    p.delete_favourite(5)
+    check("DELETE" in fdb.kinds(), "delete_favourite: an unrestricted caller removes any favourite")
+
+    # ── 1.0.1: the wake API — a MAC with no subnet is for an unrestricted key only ─
+    jen_api = types.ModuleType("jen.plugin_api")
+    sys.modules["jen"] = types.ModuleType("jen")
+    sys.modules["jen.plugin_api"] = jen_api
+    sys.modules["jen"].plugin_api = jen_api
+
+    def key_can(key, subnet_id, *, allow_unattributed=False):
+        scope = key.get("subnet_ids")
+        if scope is None:
+            return True
+        return subnet_id is not None and subnet_id in scope
+
+    jen_api.api_key_can_access_subnet = key_can
+    for label, mac, key, expect in (
+        ("a scoped key, MAC in its subnet", "aa:bb:cc:dd:ee:01", {"name": "k", "subnet_ids": [1]}, "ok"),
+        ("a scoped key, MAC in another subnet", "aa:bb:cc:dd:ee:02", {"name": "k", "subnet_ids": [1]}, 403),
+        ("a scoped key, MAC with no subnet", "aa:bb:cc:dd:ee:99", {"name": "k", "subnet_ids": [1]}, 403),
+        ("an unrestricted key, MAC with no subnet", "aa:bb:cc:dd:ee:99", {"name": "all", "subnet_ids": None}, "ok"),
+    ):
+        sent.clear()
+        p._last_sent.clear()
+        p._get_db = lambda: FakeDB([None, None])
+        sys.modules["flask"].g = types.SimpleNamespace(api_key=key)
+        p.request = types.SimpleNamespace(get_json=lambda silent=True, mac=mac: {"mac": mac})
+        result = p._api_wake()
+        got = result[1] if isinstance(result, tuple) else "ok"
+        check(got == expect and (len(sent) == 1) == (expect == "ok"), f"_api_wake: {label} -> {expect}")
+    p.request = None
+
+    # ── 1.0.1: sending prunes the rate map ───────────────────────────────────
+    p._last_sent.clear()
+    p._last_sent["aa:aa:aa:aa:aa:aa"] = -1000.0  # long dead
+    p._get_db = lambda: FakeDB()
+    p._wake_mac("aa:bb:cc:dd:ee:01", 1, None, "tester")
+    check(
+        "aa:aa:aa:aa:aa:aa" not in p._last_sent and "aa:bb:cc:dd:ee:01" in p._last_sent,
+        "_wake_mac: a wake evicts long-dead rate entries and records the new one",
+    )
+
     # ── register(): actually runs end to end against a stub jen.plugin_api ──
     row_action_calls = _stub_jen_plugin_api()
     try:

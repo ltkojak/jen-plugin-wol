@@ -123,6 +123,14 @@ def rate_limited(last_sent_at, now, window_s=_RATE_LIMIT_WINDOW_S):
     return (now - last_sent_at) < window_s
 
 
+def prune_rate_map(last_sent, now, keep_s=60):
+    """Pure: `last_sent` ({mac: monotonic seconds}) without the entries older than
+    `keep_s`. Only the last few seconds matter to the rate limit, so an entry older
+    than a minute is dead weight — and the map used to grow by one entry per distinct
+    MAC ever woken, for as long as Jen ran."""
+    return {mac: at for mac, at in last_sent.items() if (now - at) < keep_s}
+
+
 # ── DB helpers (same shape as every other bundled plugin) ──────────────────────
 
 
@@ -144,10 +152,12 @@ def _subnet_map():
     return subnet_map()
 
 
-def _accessible_subnets():
-    from jen.plugin_api import get_accessible_subnet_map
+def _can(subnet_id):
+    """May the session user act on something in `subnet_id`? None ("no attributable
+    subnet") is for unrestricted users only — plugin_api decides (v5.65.2)."""
+    from jen.plugin_api import can_access_subnet
 
-    return get_accessible_subnet_map()
+    return can_access_subnet(subnet_id)
 
 
 def _is_admin():
@@ -167,10 +177,6 @@ def _require_write():
         return True
     flash("Viewers can look at Wake & Actions but not send a wake packet.", "error")
     return False
-
-
-def _all_subnets_user():
-    return bool(getattr(current_user, "all_subnets", False))
 
 
 def _audit(action, target, detail):
@@ -224,10 +230,29 @@ def _current_subnet_for_mac(mac):
     return None
 
 
-def _subnet_accessible(subnet_id, accessible, all_subnets):
-    if all_subnets:
-        return True
-    return subnet_id is not None and subnet_id in accessible
+def _wake_subject(mac):
+    """(subnet_id, secureon) — what a wake of `mac` is judged and sent on. The subnet is the
+    one the MAC is in NOW (a lease, then a reservation); a MAC with neither falls back to the
+    subnet stored on its favourite, which whoever added it had to be allowed to see. A value in
+    the request is never the subject: the row action used to pass `subnet_id` in the query
+    string and the route authorised THAT, while the packet always also went out on the limited
+    broadcast to the Jen host's own segment — so naming a subnet you own woke any host."""
+    secureon, stored_subnet = None, None
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT subnet_id, secureon FROM wol_hosts WHERE mac=%s", (mac,))
+            row = cur.fetchone()
+            if row:
+                secureon, stored_subnet = row.get("secureon"), row.get("subnet_id")
+    finally:
+        if db:
+            db.close()
+    subnet_id = _current_subnet_for_mac(mac)
+    if subnet_id is None:
+        subnet_id = stored_subnet
+    return subnet_id, secureon
 
 
 # ── Sending (impure: socket) ─────────────────────────────────────────────────
@@ -261,6 +286,8 @@ def _wake_mac(mac, subnet_id, secureon_raw, actor):
     """The shared impure core behind every wake entry point: rate
     limit, build+send, audit, emit. Returns (ok, error_message)."""
     now = time.monotonic()
+    global _last_sent
+    _last_sent = prune_rate_map(_last_sent, now)
     if rate_limited(_last_sent.get(mac), now):
         return False, "Wake packet already sent for this MAC in the last 5 seconds."
     secureon = None
@@ -320,9 +347,8 @@ def _favourite_rows():
 
 
 def _candidate_hosts():
-    """Reservations across accessible subnets, for the Add Favourite picker."""
-    accessible = _accessible_subnets()
-    all_subnets = _all_subnets_user()
+    """Reservations across the caller's subnets, for the Add Favourite picker (a global
+    reservation belongs to no subnet, so it is for unrestricted callers)."""
     out = []
     kdb = None
     try:
@@ -337,7 +363,7 @@ def _candidate_hosts():
                 if not row["ip"] or row.get("ident_type") != 0 or not row.get("ident_hex"):
                     continue
                 sid = row.get("subnet_id") or None
-                if not _subnet_accessible(sid, accessible, all_subnets):
+                if not _can(sid):
                     continue
                 hex_mac = row["ident_hex"]
                 if len(hex_mac) != 12:
@@ -355,9 +381,7 @@ def _candidate_hosts():
 @bp.route("/")
 @login_required
 def index():
-    accessible = _accessible_subnets()
-    all_subnets = _all_subnets_user()
-    rows = [r for r in _favourite_rows() if _subnet_accessible(r["subnet_id"], accessible, all_subnets)]
+    rows = [r for r in _favourite_rows() if _can(r["subnet_id"])]
     subnet_map = _subnet_map()
     for r in rows:
         r["subnet_name"] = subnet_map.get(r["subnet_id"], {}).get("name", "") if r["subnet_id"] else "—"
@@ -382,11 +406,15 @@ def add_favourite():
         return redirect(url_for("wol.index"))
     ip = request.form.get("ip", "").strip()[:15]
     label = request.form.get("label", "").strip()[:100]
-    subnet_id = _derive_subnet_id(ip, _subnet_map()) if ip else None
-    accessible = _accessible_subnets()
-    if not _subnet_accessible(subnet_id, accessible, _all_subnets_user()):
-        flash("That address is outside your accessible subnets.", "error")
+    # The subnet is where the MAC is (a lease or reservation), never worked out from an address
+    # the caller typed: the optional IP used to be enough to attach ANY MAC to a subnet the caller
+    # owns. A MAC Jen has never seen has no subnet and is for unrestricted callers only.
+    subnet_id = _current_subnet_for_mac(mac)
+    if not _can(subnet_id):
+        flash("That MAC is not on a subnet you can access.", "error")
         return redirect(url_for("wol.index"))
+    if ip and _derive_subnet_id(ip, _subnet_map()) != subnet_id:
+        ip = ""  # a typed address that is not in the MAC's own subnet is not stored
 
     secureon_raw = request.form.get("secureon", "").strip()
     secureon = None
@@ -404,7 +432,7 @@ def add_favourite():
             cur.execute(
                 "INSERT INTO wol_hosts (mac, ip, subnet_id, label, secureon) VALUES (%s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE ip=VALUES(ip), subnet_id=VALUES(subnet_id), label=VALUES(label), "
-                "secureon=VALUES(secureon)",
+                "secureon=IF(VALUES(secureon) IS NULL, secureon, VALUES(secureon))",
                 (mac, ip or None, subnet_id, label, secureon),
             )
         db.commit()
@@ -427,6 +455,11 @@ def delete_favourite(host_id):
     try:
         db = _get_db()
         with db.cursor() as cur:
+            cur.execute("SELECT subnet_id FROM wol_hosts WHERE id=%s", (host_id,))
+            row = cur.fetchone()
+            if row is None or not _can(row["subnet_id"]):
+                flash("Favourite not found.", "error")
+                return redirect(url_for("wol.index"))
             cur.execute("DELETE FROM wol_hosts WHERE id=%s", (host_id,))
         db.commit()
         flash("Favourite removed.", "success")
@@ -456,8 +489,8 @@ def wake_favourite(host_id):
     if not row:
         flash("Favourite not found.", "error")
         return redirect(url_for("wol.index"))
-    if not _subnet_accessible(row["subnet_id"], _accessible_subnets(), _all_subnets_user()):
-        flash("That address is outside your accessible subnets.", "error")
+    if not _can(row["subnet_id"]):
+        flash("Favourite not found.", "error")
         return redirect(url_for("wol.index"))
     ok, err = _wake_mac(row["mac"], row["subnet_id"], row.get("secureon"), current_user.username)
     flash(f"Wake packet sent to {row.get('label') or row['mac']}." if ok else err, "success" if ok else "error")
@@ -479,26 +512,12 @@ def wake_from_row():
     if not mac:
         flash("Invalid MAC address.", "error")
         return redirect(url_for("wol.index"))
-    try:
-        subnet_id = int(request.args.get("subnet_id", ""))
-    except (TypeError, ValueError):
-        subnet_id = _current_subnet_for_mac(mac)
-    if not _subnet_accessible(subnet_id, _accessible_subnets(), _all_subnets_user()):
-        flash("That address is outside your accessible subnets.", "error")
+    # the `subnet_id` in the query string is only what the row that linked here knew: it is
+    # ignored, and the subnet is worked out from the MAC (see _wake_subject)
+    subnet_id, secureon = _wake_subject(mac)
+    if not _can(subnet_id):
+        flash("That MAC is not on a subnet you can access.", "error")
         return redirect(url_for("wol.index"))
-
-    secureon = None
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("SELECT secureon FROM wol_hosts WHERE mac=%s", (mac,))
-            row = cur.fetchone()
-            if row:
-                secureon = row.get("secureon")
-    finally:
-        if db:
-            db.close()
 
     ok, err = _wake_mac(mac, subnet_id, secureon, current_user.username)
     flash(f"Wake packet sent to {mac}." if ok else err, "success" if ok else "error")
@@ -516,27 +535,16 @@ api_bp = Blueprint("wol_api", __name__, url_prefix="/api/v1/plugins/wol")
 def _api_wake():
     from flask import g
 
-    from jen.plugin_api import filter_subnet_ids
+    from jen.plugin_api import api_key_can_access_subnet
 
     body = request.get_json(silent=True) or {}
     mac = _normalize_mac(str(body.get("mac", "")))
     if not mac:
         return jsonify({"error": "invalid mac"}), 400
-    subnet_id = _current_subnet_for_mac(mac)
-    if subnet_id is not None and subnet_id not in filter_subnet_ids(g.api_key, [subnet_id]):
+    subnet_id, secureon = _wake_subject(mac)
+    # a MAC with no attributable subnet is for an unrestricted key only — a scoped key read it as "allow"
+    if not api_key_can_access_subnet(g.api_key, subnet_id):
         return jsonify({"error": "subnet not accessible to this key"}), 403
-    secureon = None
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("SELECT secureon FROM wol_hosts WHERE mac=%s", (mac,))
-            row = cur.fetchone()
-            if row:
-                secureon = row.get("secureon")
-    finally:
-        if db:
-            db.close()
     ok, err = _wake_mac(mac, subnet_id, secureon, f"api:{g.api_key['name']}")
     if not ok:
         return jsonify({"error": err}), 400 if "5 seconds" in err else 500
@@ -557,7 +565,7 @@ def register(app):
             surface,
             label="Wake",
             icon="zap",
-            href="/management/wol/wake?mac={mac}&ip={ip}&subnet_id={subnet_id}",
+            href="/management/wol/wake?mac={mac}",
             method="POST",
             confirm="Send a wake packet to {mac}?",
         )

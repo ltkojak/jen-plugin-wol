@@ -2,6 +2,14 @@
 {% block title %}Wake{% endblock %}
 {% block content %}
 
+<style>
+/* static declarations live here, not in inline style attributes (docs/ui.md); a plugin page has no
+   shared stylesheet hook, so the page carries its own block */
+.wol-card-flush{padding:0}
+.wol-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center}
+.wol-dialog{width:min(440px,94vw);max-height:90vh;overflow-y:auto}
+</style>
+
 <div class="page-header flex items-center between wrap gap-3">
     <div>
         <h1>{{ icon("zap", "ico-lg") }} Wake</h1>
@@ -16,7 +24,7 @@
 <div class="alert alert-info">{{ icon("info") }} Wake & Actions targets IPv4 addresses only.</div>
 {% endif %}
 
-<div class="card" style="padding:0;">
+<div class="card wol-card-flush">
 <div class="table-wrap">
 <table class="rowlist">
     <thead><tr>
@@ -65,8 +73,8 @@
 </div>
 
 {% if is_admin %}
-<div id="wol-add-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
-<div class="card" style="width:min(440px,94vw);max-height:90vh;overflow-y:auto;">
+<div id="wol-add-modal" class="wol-modal">
+<div class="card wol-dialog">
     <div class="flex between items-center mb-3">
         <h3>{{ icon("plus") }} Add Favourite</h3>
         <button id="wol-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
@@ -87,11 +95,11 @@
             <input type="text" name="label" id="wol-label" maxlength="100" autocomplete="off">
         </div>
         <div class="form-group">
-            <label>IP <span class="small muted">(optional — used to work out the subnet)</span></label>
+            <label>IP <span class="small muted">(optional — shown on the row; the subnet comes from the MAC)</span></label>
             <input type="text" name="ip" id="wol-ip" class="mono" autocomplete="off">
         </div>
         <div class="form-group">
-            <label>SecureOn password <span class="small muted">(optional)</span></label>
+            <label>SecureOn password <span class="small muted">(optional — leave blank to keep the saved one)</span></label>
             <input type="text" name="secureon" class="mono" placeholder="aa:bb:cc:dd" autocomplete="off">
         </div>
         <div class="flex gap-2 mt-3">

@@ -6,7 +6,7 @@ Wake-on-LAN from any Lease, Reservation, or Device row in [Jen](https://github.c
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.61.0 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.2 or later
 
 ## How a wake packet is sent
 
@@ -15,11 +15,11 @@ A standard 102-byte Wake-on-LAN magic packet (six `0xFF` bytes, then the target 
 ## Features
 
 - **Wake** row action on Lease, Reservation, and Device rows — sends a packet with one click and a confirmation naming the actual MAC
-- **Favourites** page (nav Management → Wake): save a MAC (with an optional label, IP for subnet lookup, and SecureOn password), wake it with one click, see when it was last woken and by whom
+- **Favourites** page (nav Management → Wake): save a MAC (with an optional label, an IP to show on the row, and a SecureOn password that a blank re-add keeps), wake it with one click, see when it was last woken and by whom
 - **Rate-limited**: at most one wake packet per MAC every 5 seconds, whichever entry point sent it
 - Every wake is audited (`WOL_SENT`) and emits a `plugin.wol.sent` event
 - **JSON API**: `POST /api/v1/plugins/wol/wake` `{"mac": "..."}` (write key), scoped to the calling key's accessible subnets
-- Respects Jen's subnet access control on both the favourites list and the "Add Favourite" picker — a favourite on a subnet you can't see is neither shown nor wakeable. Adding, removing, and waking a favourite, and using the row action, all need admin — viewers are read-only
+- Respects Jen's subnet access control on both the favourites list and the "Add Favourite" picker — a favourite on a subnet you can't see is neither shown nor wakeable. The subnet of a wake or a new favourite is worked out from the MAC (its active lease, then its reservation) — never from a value in the request — and a MAC Jen has never seen has no subnet, so it is for accounts that can see every subnet (API keys too). Adding, removing, and waking a favourite, and using the row action, all need admin — viewers are read-only
 
 ## Installation
 
@@ -29,7 +29,7 @@ To install by hand instead (a checkout without registry access), unzip `plugin.z
 
 ## Development
 
-`python3 tools/verify.py --build` rebuilds `plugin.zip` deterministically from the tree and runs the same checks CI runs on every push and tag: the zip matches the tree byte-for-byte, no template carries an inline event handler, an un-nonce'd `<script>`, or a POST form missing `csrf_token`, `manifest.json`'s version matches the top `CHANGELOG.md` entry, and `plugin.py` compiles and passes ruff. The committed `plugin.zip` is the artifact Jen installs, so rebuild it in the same commit as any change.
+`python3 tools/verify.py --build` rebuilds `plugin.zip` deterministically from the tree and runs the same checks CI runs on every push and tag: the zip matches the tree byte-for-byte, no template carries an inline event handler, an inline `style=` attribute, an un-nonce'd `<script>`, or a POST form missing `csrf_token`, `manifest.json`'s version matches the top `CHANGELOG.md` entry, and `plugin.py` compiles and passes ruff. The committed `plugin.zip` is the artifact Jen installs, so rebuild it in the same commit as any change.
 
 `python3 tools/test_plugin.py` exercises every pure function — MAC normalisation, the magic packet builder (checked byte-for-byte against a hand-computed packet), SecureOn password parsing, directed-broadcast address computation, and the rate-limit window — plus calls `register(app)` end to end against a stub `jen.plugin_api`, no Jen, database, or network access needed.
 
