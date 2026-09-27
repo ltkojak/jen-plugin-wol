@@ -6,7 +6,7 @@ Wake-on-LAN from any Lease, Reservation, or Device row in [Jen](https://github.c
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.65.6 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.10 or later
 
 ## How a wake packet is sent
 

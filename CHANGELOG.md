@@ -1,5 +1,46 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.0.3] - 2026-09-27
+
+Jen's Q100 sweep: the favourites list, adding one, deleting one and waking one judged access on the
+STORED subnet a favourite was created with, which nothing ever refreshed — the same shape of bug
+Presence 1.0.2 fixed for tracked devices. `wake_from_row` and the JSON API already judged the MAC's
+CURRENT subnet correctly; the favourites themselves did not.
+
+### Fixed: a moved favourite stayed visible, and wakeable, to the wrong administrator
+
+A favourite is added once and its subnet stored then. If the device later moves — a new lease in a
+different subnet, a changed reservation — the favourites list, deleting a favourite and waking one all
+still judged access on that stale stored value. An administrator scoped to subnet A who had favourited a
+laptop still saw it, and could wake it, after it moved to subnet B; an administrator newly responsible for
+subnet B would not see it at all. Every one of the three now judges the MAC's subnet as it is right now
+(Jen's one precedence: a current lease, then a reservation, then the device's last known subnet), falling
+back to the stored value only when the MAC has none currently — the list's display and the packet's
+target broadcast domain move with it too.
+
+### Fixed: re-adding an existing favourite could silently reassign it
+
+"Add Favourite" for a MAC that already had one judged access on the MAC's current subnet and then
+overwrote the existing row's subnet, address and label. An administrator who could see where the MAC is
+now could take over — and relocate — a favourite an administrator for a different subnet had created,
+without ever being checked against the row they were about to change. The existing row, when there is
+one, is now authorised on its own subject first (current subnet, its own stored value as the fallback),
+and this route never moves a favourite's subnet.
+
+### Fixed: two smaller findings from the same audit
+
+- The JSON API mapped a stored SecureOn password that could not be decrypted — a clear, caller-visible
+  refusal ("enter it again") — to a 500, the same as an actual server fault. It is `409` now.
+- `_wake_subject` (behind `wake_from_row` and the JSON API) had no exception handling around its
+  database read at all; a failure there used to propagate into an uncaught error. It now degrades to
+  judging the wake on the MAC's current subnet alone and logs the failure, rather than crashing.
+
+### Changed
+
+- The MAC check delegates to Jen's shared `normalize_mac()`.
+- `tools/test_plugin.py` checks a favourite that moved into and out of the caller's subnet directly, that
+  re-adding an existing favourite never changes its stored subnet, and the new 409 mapping.
+
 ## [1.0.2] - 2026-09-25
 
 Requires Jen 5.65.6 or later (`client_subnet_for_mac` in the plugin API). Adds one migration (the `secureon` column becomes `TEXT` so it can hold the encrypted form); it runs by itself on the next start.

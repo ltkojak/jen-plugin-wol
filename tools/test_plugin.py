@@ -53,6 +53,18 @@ class _FakeApp:
         pass
 
 
+def _stub_normalize_mac(raw):
+    import re as _re
+
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    cleaned = _re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+    if len(cleaned) != 12:
+        return None
+    mac = ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
+    return mac if _re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac) else None
+
+
 def _stub_jen_plugin_api():
     """A stub `jen`/`jen.plugin_api` sufficient for register(app) to run
     end to end, with register_alert_type-style validation left out
@@ -75,6 +87,7 @@ def _stub_jen_plugin_api():
     plugin_api = types.ModuleType("jen.plugin_api")
     plugin_api.register_row_action = register_row_action
     plugin_api.api_key_required = api_key_required
+    plugin_api.normalize_mac = _stub_normalize_mac
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -104,6 +117,7 @@ def main():
     p = load_plugin()
 
     # ── MAC normalisation ────────────────────────────────────────────────────
+    _stub_jen_plugin_api()
     check(p._normalize_mac("AA:BB:CC:DD:EE:FF") == "aa:bb:cc:dd:ee:ff", "_normalize_mac: uppercase colon form")
     check(p._normalize_mac("aabbccddeeff") == "aa:bb:cc:dd:ee:ff", "_normalize_mac: bare hex form")
     check(p._normalize_mac("AA-BB-CC-DD-EE-FF") == "aa:bb:cc:dd:ee:ff", "_normalize_mac: hyphen-separated form")
@@ -280,7 +294,10 @@ def main():
         p._get_db = lambda fdb=fdb: fdb
         p.request = types.SimpleNamespace(form={"mac": mac, "ip": ip, "label": "x", "secureon": ""})
         p.add_favourite()
-        check(fdb.statements == [], f"add_favourite: {label} is refused, nothing stored")
+        check(
+            "INSERT" not in fdb.kinds(),
+            f"add_favourite: {label} is refused, nothing stored (got {fdb.kinds()})",
+        )
     fdb = FakeDB()
     p._get_db = lambda fdb=fdb: fdb
     p.request = types.SimpleNamespace(form={"mac": "aa:bb:cc:dd:ee:01", "ip": "10.2.0.9", "label": "x", "secureon": ""})
@@ -296,30 +313,81 @@ def main():
     )
 
     # ── 1.0.1: a favourite is judged on its own row ──────────────────────────
+    # _current_subnet_for_mac returns None here so each case is judged on the row's own STORED
+    # subnet, exactly as before the moved-favourite fix (that fix gets its own tests below).
     p._can = only_one
-    fdb = FakeDB([{"subnet_id": 2}])
+    p._current_subnet_for_mac = lambda mac: None
+    fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}])
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favourite(5)
     check(
         "DELETE" not in fdb.kinds() and flashed[-1] == "Favourite not found.",
         "delete_favourite: a favourite in subnet 2 reads as not found to a caller scoped to subnet 1",
     )
-    fdb = FakeDB([{"subnet_id": None}])
+    fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": None}])
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favourite(5)
     check("DELETE" not in fdb.kinds(), "delete_favourite: a favourite with no subnet is not a scoped caller's")
-    fdb = FakeDB([{"subnet_id": 1}])
+    fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 1}])
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favourite(5)
     check("DELETE" in fdb.kinds(), "delete_favourite: a favourite in the caller's own subnet is theirs to remove")
     p._can = everything
-    fdb = FakeDB([{"subnet_id": None}])
+    fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": None}])
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favourite(5)
     check("DELETE" in fdb.kinds(), "delete_favourite: an unrestricted caller removes any favourite")
+    p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
+
+    # ── 1.0.3: a favourite is judged on where its MAC is NOW, stored only as a fallback ──
+    p._can = only_one
+    # stored subnet 1 (the caller's own), but the MAC has since moved to subnet 2
+    p._current_subnet_for_mac = lambda mac: 2
+    fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 1}])
+    p._get_db = lambda fdb=fdb: fdb
+    p.delete_favourite(5)
+    check(
+        "DELETE" not in fdb.kinds(),
+        "delete_favourite: a favourite that MOVED out of the caller's subnet is not theirs any more",
+    )
+    fdb = FakeDB([{"subnet_id": 1, "secureon": None, "label": "x", "mac": "aa:bb:cc:dd:ee:01"}])
+    p._get_db = lambda fdb=fdb: fdb
+    sent.clear()
+    p.wake_favourite(5)
+    check(
+        sent == [],
+        f"wake_favourite: a favourite that MOVED out of the caller's subnet cannot be woken by them (got {sent})",
+    )
+    # and the reverse: stored subnet 2 (not the caller's), but the MAC is now in the caller's subnet 1
+    p._current_subnet_for_mac = lambda mac: 1
+    fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}])
+    p._get_db = lambda fdb=fdb: fdb
+    p.delete_favourite(5)
+    check(
+        "DELETE" in fdb.kinds(),
+        "delete_favourite: a favourite that moved INTO the caller's subnet is now theirs",
+    )
+    p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
+
+    # ── 1.0.3: add_favourite never moves an existing favourite's subnet ──────
+    p._can = everything
+    fdb = FakeDB([{"subnet_id": 2}])  # an existing row, stored in subnet 2
+    p._get_db = lambda fdb=fdb: fdb
+    p.request = types.SimpleNamespace(form={"mac": "aa:bb:cc:dd:ee:01", "ip": "", "label": "renamed", "secureon": ""})
+    p.add_favourite()
+    insert = [s for s in fdb.statements if s[0] == "INSERT"]
+    check(
+        len(insert) == 1 and insert[0][2][2] == 2,
+        f"add_favourite: re-adding an existing favourite keeps its STORED subnet, not the MAC's current one (got {insert and insert[0][2]})",
+    )
+    check(
+        "subnet_id=VALUES(subnet_id)" not in insert[0][1],
+        "add_favourite: subnet_id is not in the UPDATE clause at all",
+    )
 
     # ── 1.0.1: the wake API — a MAC with no subnet is for an unrestricted key only ─
     jen_api = types.ModuleType("jen.plugin_api")
+    jen_api.normalize_mac = _stub_normalize_mac
     sys.modules["jen"] = types.ModuleType("jen")
     sys.modules["jen.plugin_api"] = jen_api
     sys.modules["jen"].plugin_api = jen_api
@@ -368,6 +436,7 @@ def main():
     jen_api = types.ModuleType("jen.plugin_api")
     jen_api.encrypt_secret = lambda s: "v1:" + s[::-1]  # a stand-in with the same shape: reversible, prefixed
     jen_api.decrypt_secret = lambda s: s[3:][::-1]
+    jen_api.normalize_mac = _stub_normalize_mac
     sys.modules["jen"] = types.ModuleType("jen")
     sys.modules["jen.plugin_api"] = jen_api
     sys.modules["jen"].plugin_api = jen_api
@@ -422,6 +491,17 @@ def main():
         not ok and not sent and "marker-xyz" not in err,
         f"_wake_mac: an undecryptable SecureOn refuses the wake without leaking the exception (got {err!r})",
     )
+
+    # ── 1.0.3: the API maps that same refusal to 409, not 500 ────────────────
+    jen_api.api_key_can_access_subnet = lambda key, sid, **k: True
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": None})
+    p._get_db = lambda: FakeDB([{"subnet_id": 1, "secureon": "v1:zzz"}])
+    p.request = types.SimpleNamespace(get_json=lambda silent=True: {"mac": "aa:bb:cc:dd:ee:01"})
+    result = p._api_wake()
+    check(
+        isinstance(result, tuple) and result[1] == 409,
+        f"_api_wake: an undecryptable stored SecureOn is a 409, not a 500 (got {result})",
+    )
     jen_api.decrypt_secret = lambda s: s[3:][::-1]
 
     # ── 1.0.2: the subnet comes from Jen's ONE precedence ────────────────────
@@ -432,6 +512,22 @@ def main():
         and fresh._current_subnet_for_mac("aa:bb:cc:dd:ee:10") is None,
         "_current_subnet_for_mac: answered by plugin_api.client_subnet_for_mac, not a private copy",
     )
+
+    # ── 1.0.3: the favourites list is judged on the MAC's CURRENT subnet ─────
+    p._can = only_one
+    p._favourite_rows = lambda: [
+        {"id": 1, "mac": "aa:bb:cc:dd:ee:01", "ip": "10.1.0.5", "subnet_id": 2, "label": "moved-in", "secureon": None},
+        {"id": 2, "mac": "aa:bb:cc:dd:ee:02", "ip": "10.2.0.5", "subnet_id": 1, "label": "moved-out", "secureon": None},
+    ]
+    p._current_subnet_for_mac = lambda mac: {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}[mac]
+    p._subnet_map = lambda: {1: {"name": "A", "cidr": "10.1.0.0/24"}, 2: {"name": "B", "cidr": "10.2.0.0/24"}}
+    p.render_template = lambda name, **kw: kw
+    page = p.index()
+    check(
+        [r["label"] for r in page["rows"]] == ["moved-in"],
+        f"index: judged on the MAC's current subnet, not the stale stored one (got {[r['label'] for r in page['rows']]})",
+    )
+    check(page["rows"][0]["subnet_name"] == "A", "index: the shown subnet name is the current one too")
 
     # ── 1.0.2: a failed send does not put the exception text on the page ─────
     p._last_sent.clear()
