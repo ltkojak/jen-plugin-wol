@@ -1,5 +1,25 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.0.4] - 2026-09-27
+
+Follow-up to 1.0.3, found while Jen's own authorization matrix added a row for a malformed API
+body on every plugin API route.
+
+### Fixed: a malformed JSON body crashed the wake API instead of refusing it
+
+`_api_wake` read its body as `request.get_json(silent=True) or {}` — the `or {}` only rescues a
+falsy body (`None`, an empty object), so a JSON array or any other non-object value reached
+`body.get("mac", "")` directly and raised `AttributeError`, an unhandled 500. It now goes through
+Jen's shared `json_object_body()`/`str_field()` (the same helpers every other plugin API route
+already uses), which refuse a malformed body with a real `400 {"error": "expected a JSON object"}`
+before touching it. A non-string `mac` (`{"mac": 5}`) is unaffected — it was, and still is, a
+caller-visible "invalid mac".
+
+### Changed
+
+- `tools/test_plugin.py` sends a JSON array to `_api_wake` and checks it gets 400, not an
+  uncaught exception.
+
 ## [1.0.3] - 2026-09-27
 
 Jen's Q100 sweep: the favourites list, adding one, deleting one and waking one judged access on the

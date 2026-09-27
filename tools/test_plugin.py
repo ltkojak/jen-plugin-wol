@@ -399,6 +399,22 @@ def main():
         return subnet_id is not None and subnet_id in scope
 
     jen_api.api_key_can_access_subnet = key_can
+
+    def _stub_json_object_body():
+        body = sys.modules["flask"].request.get_json(silent=True)
+        if isinstance(body, dict):
+            return body, None
+        return None, ("error-response", 400)
+
+    def _stub_str_field(body, name, max_len=None):
+        value = body.get(name) if isinstance(body, dict) else None
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        return value[:max_len] if max_len is not None else value
+
+    jen_api.json_object_body = _stub_json_object_body
+    jen_api.str_field = _stub_str_field
     for label, mac, key, expect in (
         ("a scoped key, MAC in its subnet", "aa:bb:cc:dd:ee:01", {"name": "k", "subnet_ids": [1]}, "ok"),
         ("a scoped key, MAC in another subnet", "aa:bb:cc:dd:ee:02", {"name": "k", "subnet_ids": [1]}, 403),
@@ -409,11 +425,24 @@ def main():
         p._last_sent.clear()
         p._get_db = lambda: FakeDB([None, None])
         sys.modules["flask"].g = types.SimpleNamespace(api_key=key)
-        p.request = types.SimpleNamespace(get_json=lambda silent=True, mac=mac: {"mac": mac})
+        sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True, mac=mac: {"mac": mac})
         result = p._api_wake()
         got = result[1] if isinstance(result, tuple) else "ok"
         check(got == expect and (len(sent) == 1) == (expect == "ok"), f"_api_wake: {label} -> {expect}")
+
+    # v1.0.4 — a malformed body (a JSON array, not an object) used to reach body.get(...) directly and
+    # raise AttributeError, an unhandled 500; json_object_body() now refuses it with a real 400 first.
+    sent.clear()
+    p._get_db = lambda: FakeDB([None, None])
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "all", "subnet_ids": None})
+    sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True: [1, 2, 3])
+    result = p._api_wake()
+    check(
+        isinstance(result, tuple) and result[1] == 400 and not sent,
+        f"_api_wake: a JSON array body is refused with 400, not an uncaught 500 (got {result})",
+    )
     p.request = None
+    sys.modules["flask"].request = None
 
     # ── 1.0.1: sending prunes the rate map ───────────────────────────────────
     p._last_sent.clear()
@@ -437,6 +466,8 @@ def main():
     jen_api.encrypt_secret = lambda s: "v1:" + s[::-1]  # a stand-in with the same shape: reversible, prefixed
     jen_api.decrypt_secret = lambda s: s[3:][::-1]
     jen_api.normalize_mac = _stub_normalize_mac
+    jen_api.json_object_body = _stub_json_object_body
+    jen_api.str_field = _stub_str_field
     sys.modules["jen"] = types.ModuleType("jen")
     sys.modules["jen.plugin_api"] = jen_api
     sys.modules["jen"].plugin_api = jen_api
@@ -496,7 +527,7 @@ def main():
     jen_api.api_key_can_access_subnet = lambda key, sid, **k: True
     sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": None})
     p._get_db = lambda: FakeDB([{"subnet_id": 1, "secureon": "v1:zzz"}])
-    p.request = types.SimpleNamespace(get_json=lambda silent=True: {"mac": "aa:bb:cc:dd:ee:01"})
+    sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True: {"mac": "aa:bb:cc:dd:ee:01"})
     result = p._api_wake()
     check(
         isinstance(result, tuple) and result[1] == 409,

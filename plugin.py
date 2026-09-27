@@ -634,10 +634,15 @@ api_bp = Blueprint("wol_api", __name__, url_prefix="/api/v1/plugins/wol")
 def _api_wake():
     from flask import g
 
-    from jen.plugin_api import api_key_can_access_subnet
+    from jen.plugin_api import api_key_can_access_subnet, json_object_body, str_field
 
-    body = request.get_json(silent=True) or {}
-    mac = _normalize_mac(str(body.get("mac", "")))
+    # v1.0.4 — `request.get_json(silent=True) or {}` let a JSON array or a bare string through
+    # (only an empty/falsy body was rescued to {}); body.get("mac", "") then raised AttributeError
+    # on a list, an unhandled 500 instead of a caller-visible refusal.
+    body, err_response = json_object_body()
+    if err_response is not None:
+        return err_response
+    mac = _normalize_mac(str_field(body, "mac"))
     if not mac:
         return jsonify({"error": "invalid mac"}), 400
     subnet_id, secureon = _wake_subject(mac)
