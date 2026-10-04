@@ -363,6 +363,79 @@ def _wake_mac(mac, subnet_id, secureon_raw, actor):
     return True, ""
 
 
+# ── Investigation provider (v1.1.0, Jen 5.68.0) ──────────────────────────────
+
+
+def in_scope(subnet_id, accessible_subnet_ids, all_subnets):
+    """Pure: may a caller with this scope see something whose subnet is `subnet_id`? An unrestricted caller may; a
+    restricted one only for a subnet in its own set - and a subnet of None ("no attributable subnet") is for unrestricted
+    callers only, never read as allow."""
+    if all_subnets:
+        return True
+    return subnet_id is not None and subnet_id in set(accessible_subnet_ids or ())
+
+
+def _when(value):
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M UTC")
+    return str(value) if value else ""
+
+
+def investigation_card(favourite):
+    """Pure: the Investigation page's card from this MAC's favourite row, or None when it is not a favourite - a client that
+    was never saved here has nothing for this plugin to say (a wake from a row leaves no record of its own to show)."""
+    if not favourite:
+        return None
+    label = favourite.get("label") or ""
+    woken = favourite.get("last_woken_at")
+    by = favourite.get("last_woken_by") or ""
+    summary = f"A favourite ({label})" if label else "A favourite"
+    summary += f"; last woken {_when(woken)}" + (f" by {by}" if by else "") if woken else "; never woken from Jen"
+    rows = [
+        {"label": "Favourite", "value": label or "saved without a label"},
+        {"label": "SecureOn password", "value": "set" if favourite.get("secureon") else "not set"},
+        {"label": "Last woken", "value": _when(woken) if woken else "never"},
+    ]
+    if woken and by:
+        rows.append({"label": "Woken by", "value": by})
+    return {"summary": summary, "status": "ok", "rows": rows}
+
+
+def _favourite_for_mac(mac):
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT label, subnet_id, secureon, last_woken_at, last_woken_by FROM wol_hosts WHERE mac=%s",
+                (mac,),
+            )
+            return cur.fetchone()
+    finally:
+        if db:
+            db.close()
+
+
+def _investigate(subject, accessible_subnet_ids, all_subnets):
+    """The Investigation page's card for the client Jen resolved. Judged like a wake of the same MAC: the subnet it is in
+    NOW (Jen's one precedence), falling back to the subnet stored on its favourite; a client outside the caller's scope, or
+    in none for a restricted caller, gets nothing."""
+    mac = _normalize_mac(getattr(subject, "mac", "") or "")
+    if not mac:
+        return None
+    favourite = _favourite_for_mac(mac)
+    if not favourite:
+        return None
+    subnet_id = _current_subnet_for_mac(mac)
+    if subnet_id is None:
+        subnet_id = favourite.get("subnet_id")
+    if not in_scope(subnet_id, accessible_subnet_ids, all_subnets):
+        return None
+    card = investigation_card(favourite)
+    card["href"] = "/management/wol"
+    return card
+
+
 # ── Routes: page ────────────────────────────────────────────────────────────
 
 
@@ -666,7 +739,7 @@ def _api_wake():
 def register(app):
     app.register_blueprint(bp)
 
-    from jen.plugin_api import api_key_required, register_row_action
+    from jen.plugin_api import api_key_required, register_investigation_provider, register_row_action
 
     api_bp.add_url_rule("/wake", "api_wake", api_key_required(write=True)(_api_wake), methods=["POST"])
     app.register_blueprint(api_bp)
@@ -681,5 +754,7 @@ def register(app):
             method="POST",
             confirm="Send a wake packet to {mac}?",
         )
+
+    register_investigation_provider(PLUGIN_ID, title="Wake & Actions", fn=_investigate)
 
     logger.info("Wake & Actions plugin registered")

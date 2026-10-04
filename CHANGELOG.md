@@ -1,5 +1,19 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.0] - 2026-10-04
+
+Requires Jen 5.68.0 (a 5.68.0 beta satisfies it): this release registers an **investigation provider**.
+
+### Added: favourite, SecureOn and last wake, on Jen's Investigation page
+
+Jen's Investigation page (`/client`) now has a "What else Jen knows" section on its Overview, and this plugin
+contributes one card to it for a client that is a saved favourite: its label, whether a SecureOn password is set (never
+the password), and when and by whom it was last woken. A client that was never saved here adds no card.
+
+The card is judged the way a wake of the same MAC is: on the subnet the MAC is in now (Jen's one precedence), falling
+back to the subnet stored on its favourite, and a client outside the caller's scope — or in no subnet, for a restricted
+caller — gets nothing. `requires_jen` moves to 5.68.0 because the hook does not exist before it.
+
 ## [1.0.4] - 2026-09-27
 
 Follow-up to 1.0.3, found while Jen's own authorization matrix added a row for a malformed API

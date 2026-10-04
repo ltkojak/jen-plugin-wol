@@ -65,6 +65,9 @@ def _stub_normalize_mac(raw):
     return mac if _re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac) else None
 
 
+INVESTIGATION_CALLS = []
+
+
 def _stub_jen_plugin_api():
     """A stub `jen`/`jen.plugin_api` sufficient for register(app) to run
     end to end, with register_alert_type-style validation left out
@@ -86,6 +89,7 @@ def _stub_jen_plugin_api():
     jen_pkg = types.ModuleType("jen")
     plugin_api = types.ModuleType("jen.plugin_api")
     plugin_api.register_row_action = register_row_action
+    plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.api_key_required = api_key_required
     plugin_api.normalize_mac = _stub_normalize_mac
     jen_pkg.plugin_api = plugin_api
@@ -583,6 +587,83 @@ def main():
     check(
         all(c[2].get("confirm") == "Send a wake packet to {mac}?" for c in row_action_calls),
         "register(): every row action carries the same confirm sentence with {mac}",
+    )
+    check(
+        len(INVESTIGATION_CALLS) == 1
+        and INVESTIGATION_CALLS[0][0] == ("wol",)
+        and INVESTIGATION_CALLS[0][1]["fn"] is p._investigate,
+        "register(): exactly one investigation provider, the plugin's own",
+    )
+
+    # ── 1.1.0: the investigation provider ────────────────────────────────────
+    check(
+        p.in_scope(1, [1], False) and not p.in_scope(2, [1], False) and not p.in_scope(None, [1], False),
+        "in_scope: a restricted caller sees only its own subnets, and None is never allow",
+    )
+    check(p.in_scope(None, [], True), "in_scope: an unrestricted caller sees an unattributed MAC")
+    check(p.investigation_card(None) is None, "investigation_card: a client that is not a favourite adds no card")
+    fav = {
+        "label": "Media PC", "subnet_id": 1, "secureon": "v1:abc", "last_woken_at": None, "last_woken_by": None,
+    }  # fmt: skip
+    card = p.investigation_card(fav)
+    check(
+        "Media PC" in card["summary"] and "never woken" in card["summary"] and card["status"] == "ok",
+        f"investigation_card: a favourite never woken says so (got {card['summary']!r})",
+    )
+    check(
+        {"label": "SecureOn password", "value": "set"} in card["rows"]
+        and all("v1:abc" not in str(r) for r in card["rows"]),
+        "investigation_card: SecureOn is reported as set - the stored value never reaches the card",
+    )
+    check(
+        {"label": "SecureOn password", "value": "not set"} in p.investigation_card(dict(fav, secureon=None))["rows"],
+        "investigation_card: no SecureOn reads as not set",
+    )
+    import datetime as _dt
+
+    woken = p.investigation_card(dict(fav, last_woken_at=_dt.datetime(2026, 10, 1, 8, 30), last_woken_by="admin"))
+    check(
+        "2026-10-01 08:30 UTC" in woken["summary"] and "by admin" in woken["summary"],
+        f"investigation_card: the last wake and who sent it (got {woken['summary']!r})",
+    )
+    subject = types.SimpleNamespace(mac="AA:BB:CC:DD:EE:01")
+    p._current_subnet_for_mac = lambda mac: 1
+    fdb = FakeDB([dict(fav)])
+    p._get_db = lambda: fdb
+    got = p._investigate(subject, [1], False)
+    check(
+        got is not None and got["href"] == "/management/wol" and "Media PC" in got["summary"],
+        f"_investigate: the card for a seeded favourite (got {got})",
+    )
+    check(
+        "wol_hosts WHERE mac=%s" in fdb.statements[0][1] and fdb.statements[0][2] == ("aa:bb:cc:dd:ee:01",),
+        "_investigate: the lookup is the one parameterised MAC query",
+    )
+    p._get_db = lambda: FakeDB([None])
+    check(p._investigate(subject, [1], False) is None, "_investigate: a client that is not a favourite gets None")
+    p._get_db = lambda: FakeDB([dict(fav)])
+    check(
+        p._investigate(subject, [2], False) is None,
+        "_investigate: a favourite in a subnet outside the caller's set is None",
+    )
+    p._current_subnet_for_mac = lambda mac: 2  # moved to subnet 2 since it was saved with subnet 1
+    p._get_db = lambda: FakeDB([dict(fav)])
+    check(
+        p._investigate(subject, [1], False) is None,
+        "_investigate: judged on where the MAC is NOW, not the stale stored subnet",
+    )
+    p._current_subnet_for_mac = lambda mac: None  # no lease or reservation: the stored subnet is the fallback
+    p._get_db = lambda: FakeDB([dict(fav)])
+    check(p._investigate(subject, [1], False) is not None, "_investigate: the stored subnet is the fallback")
+    p._get_db = lambda: FakeDB([dict(fav, subnet_id=None)])
+    check(
+        p._investigate(subject, [1], False) is None and p._investigate(subject, [], True) is not None,
+        "_investigate: a client with no subnet at all is for an unrestricted caller only",
+    )
+    check(
+        p._investigate(types.SimpleNamespace(mac=""), [1], True) is None
+        and p._investigate(types.SimpleNamespace(mac="nope"), [1], True) is None,
+        "_investigate: a subject with no (or an invalid) MAC gets None",
     )
 
     if failures:
