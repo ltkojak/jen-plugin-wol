@@ -381,7 +381,29 @@ def _when(value):
     return str(value) if value else ""
 
 
-def investigation_card(favourite):
+def subnet_label(subnet_id, subnet_map):
+    """Pure: a subnet's name for a person ("Servers (10.0.1.0/24)"), its CIDR alone when it has no name, "" when Jen does not
+    know it."""
+    info = (subnet_map or {}).get(subnet_id)
+    if not info:
+        return ""
+    name, cidr = info.get("name") or "", info.get("cidr") or ""
+    return f"{name} ({cidr})" if name and cidr else name or cidr
+
+
+def now_in(current_subnet_id, stored_subnet_id, subnet_map, accessible_subnet_ids, all_subnets):
+    """Pure: where the client is NOW, as a fact to show beside a favourite saved in `stored_subnet_id` - "" when there is
+    nothing to add (it is still there, Jen does not know, or the caller may not see that subnet: naming a subnet is access to
+    it, so a hidden one is simply not said). It is only ever shown; what the caller may see of the favourite was decided on the
+    stored subnet before this is asked."""
+    if current_subnet_id is None or current_subnet_id == stored_subnet_id:
+        return ""
+    if not in_scope(current_subnet_id, accessible_subnet_ids, all_subnets):
+        return ""
+    return subnet_label(current_subnet_id, subnet_map)
+
+
+def investigation_card(favourite, now_in_label=""):
     """Pure: the Investigation page's card from this MAC's favourite row, or None when it is not a favourite - a client that
     was never saved here has nothing for this plugin to say (a wake from a row leaves no record of its own to show)."""
     if not favourite:
@@ -398,6 +420,8 @@ def investigation_card(favourite):
     ]
     if woken and by:
         rows.append({"label": "Woken by", "value": by})
+    if now_in_label:
+        rows.append({"label": "Now in", "value": now_in_label})
     return {"summary": summary, "status": "ok", "rows": rows}
 
 
@@ -417,21 +441,27 @@ def _favourite_for_mac(mac):
 
 
 def _investigate(subject, accessible_subnet_ids, all_subnets):
-    """The Investigation page's card for the client Jen resolved. Judged like a wake of the same MAC: the subnet it is in
-    NOW (Jen's one precedence), falling back to the subnet stored on its favourite; a client outside the caller's scope, or
-    in none for a restricted caller, gets nothing."""
+    """The Investigation page's card for the client Jen resolved. A favourite is a STORED object, so it is judged by its own
+    stored subnet (v1.1.1): the subnet the client is in now is shown ("Now in ...") when the caller may see it, and never
+    widens anything - a favourite saved in a subnet the caller cannot see is not shown just because the client has since moved
+    into one they can. A favourite with no subnet is for an unrestricted caller only. (A WAKE is the other kind of act and is
+    still judged on where the host is now: see _wake_subject.)"""
     mac = _normalize_mac(getattr(subject, "mac", "") or "")
     if not mac:
         return None
     favourite = _favourite_for_mac(mac)
     if not favourite:
         return None
-    subnet_id = _current_subnet_for_mac(mac)
-    if subnet_id is None:
-        subnet_id = favourite.get("subnet_id")
-    if not in_scope(subnet_id, accessible_subnet_ids, all_subnets):
+    stored = favourite.get("subnet_id")
+    if not in_scope(stored, accessible_subnet_ids, all_subnets):
         return None
-    card = investigation_card(favourite)
+    try:
+        where_now = now_in(_current_subnet_for_mac(mac), stored, _subnet_map(), accessible_subnet_ids, all_subnets)
+    except Exception as e:
+        # only the "Now in" fact is lost: the favourite itself was already judged on its own subnet above
+        logger.error(f"Wake & Actions: could not work out where {mac} is now: {e}")
+        where_now = ""
+    card = investigation_card(favourite, where_now)
     card["href"] = "/management/wol"
     return card
 

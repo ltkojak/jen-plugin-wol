@@ -1,5 +1,18 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.1] - 2026-10-06
+
+Fix to the investigation provider added in 1.1.0. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: a favourite is judged by the subnet it was saved in, not by where the client is now
+
+1.1.0 judged the Investigation card by the subnet the MAC is in now, falling back to the favourite's own. That is the right
+question for a wake, which acts on a live host, and the wrong one for showing stored data: a favourite saved in subnet B
+(its label, whether a SecureOn password is set, who last woke it) was shown to a caller scoped to subnet A as soon as the
+client's lease moved to A. A favourite is now judged by its own stored subnet, and a favourite with no subnet is for an
+unrestricted caller only. Where the client is now is shown on the card as **Now in** when the caller may see that subnet —
+only ever as a fact, and never named when it is a subnet the caller cannot see. The wake itself is unchanged.
+
 ## [1.1.0] - 2026-10-04
 
 Requires Jen 5.68.0 (a 5.68.0 beta satisfies it): this release registers an **investigation provider**.
