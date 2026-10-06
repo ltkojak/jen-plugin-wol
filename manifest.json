@@ -1,7 +1,7 @@
 {
   "id": "wol",
   "name": "Wake & Actions",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "Wake-on-LAN from any lease, reservation, or device row, plus a favourites list for the hosts you wake often. Sends a standard magic packet (with optional SecureOn password) to both the subnet's directed broadcast and 255.255.255.255.",
   "author": "Matthew Thibodeau",
   "requires_jen": "5.68.0",

@@ -1,5 +1,19 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.3] - 2026-10-07
+
+Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: a failed existence lookup is no longer read as "no such favourite"
+
+*Add favourite* starts by looking up whether the MAC already has a favourite, and the answer decides who may touch it. That lookup
+treated a SELECT that raised the same as "no favourite", so with the database failing for that one statement the route carried on as
+if the MAC were new, judged it on the client's current subnet, and its `INSERT ... ON DUPLICATE KEY UPDATE` rewrote the label, address
+and SecureOn password of a favourite stored in a subnet the caller cannot see. The lookup now has three outcomes (found, not found,
+failed): on a failure the route flashes *Could not check the existing record — nothing was changed*, logs, writes nothing and audits
+nothing. The other statements in the plugin that read before they write were checked: delete and the wake from the list fail as a
+whole (nothing is written), and a failed read of the favourite for a wake means the wake goes ahead without its password.
+
 ## [1.1.2] - 2026-10-06
 
 Fix: the rule 1.1.1 applied to the Investigation card now applies to every surface of the plugin. No change to what Jen needs:

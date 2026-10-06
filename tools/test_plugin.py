@@ -886,6 +886,61 @@ def main():
         "_investigate: a subject with no (or an invalid) MAC gets None",
     )
 
+    # ── 1.1.3: three-state lookups. A favourite stored in B (hidden), the client visible in A, the FIRST statement raising and every
+    #    later write able to succeed: the route must refuse, write nothing and audit nothing ──
+    class _FlakyFirst:
+        def __init__(self, selects):
+            self.calls, self.dbs, self.selects = 0, [], selects
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 1:
+                bad = FakeDB()
+                bad.execute = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down"))
+                return bad
+            db = FakeDB(list(self.selects))
+            self.dbs.append(db)
+            return db
+
+    audits_h = []
+    p._audit = lambda action, target, detail: audits_h.append((action, target, detail))
+    p._require_write = lambda: True
+    p._can = only_one
+    p._current_subnet_for_mac = lambda mac: 1
+    flaky = _FlakyFirst([{"subnet_id": 2}])
+    p._get_db = flaky
+    flashed.clear()
+    p.request = types.SimpleNamespace(
+        form={"mac": "aa:bb:cc:dd:ee:01", "ip": "", "label": "hijack", "secureon": "11:22:33:44"}, args={}
+    )
+    p.add_favourite()
+    writes = [k for db in flaky.dbs for k in db.kinds() if k in ("INSERT", "UPDATE", "DELETE")]
+    check(
+        writes == []
+        and audits_h == []
+        and flashed == ["Could not check the existing record \u2014 nothing was changed."],
+        f"add_favourite: a hidden favourite, the client visible in A, the lookup raising - refused, nothing written, nothing audited "
+        f"(writes={writes}, audits={audits_h}, flashed={flashed})",
+    )
+    flaky2 = _FlakyFirst([{"subnet_id": 2}])
+    p._get_db = flaky2
+    flashed.clear()
+    p.add_favourite()
+    check(
+        flaky2.calls == 1 and not flaky2.dbs,
+        "add_favourite: after a failed lookup the route never even opens a second connection to write with",
+    )
+    # the control: the same call with a healthy lookup refuses too (hidden favourite), and a MAC with no favourite is added
+    p._get_db = lambda: FakeDB([{"subnet_id": 2}])
+    audits_h.clear()
+    flashed.clear()
+    p.add_favourite()
+    check(
+        audits_h == [] and flashed == ["That MAC is not on a subnet you can access."],
+        "add_favourite: the healthy lookup refuses a hidden favourite",
+    )
+    p.request = None
+
     if failures:
         print(f"\n{len(failures)} check(s) failed")
         return 1

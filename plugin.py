@@ -531,6 +531,9 @@ def _candidate_hosts():
     return out
 
 
+LOOKUP_REFUSAL = "Could not check the existing record — nothing was changed."
+
+
 def _where_now(mac, stored_subnet_id, subnet_map):
     """The subnet the MAC is in NOW, as text, for a favourite stored in `stored_subnet_id` - "" when it has not moved, is not
     known, or is a subnet the caller may not see (naming a subnet is access to it). Only ever shown; it decides nothing."""
@@ -588,6 +591,11 @@ def add_favourite():
     # authorised on its OWN stored subnet and nothing else (v1.0.3 let the MAC's current subnet stand in
     # for it, so a favourite saved in B was editable from A the moment the client moved to A) before
     # anything is written, and this route never moves a favourite's subnet.
+    # v1.1.3 - THREE outcomes, never two: found, not found, FAILED. The lookup used to degrade to "no existing favourite" when it
+    # raised, so with the database failing for this one SELECT the route went on as if the MAC were new, judged it on the client's
+    # CURRENT subnet and let `INSERT ... ON DUPLICATE KEY UPDATE` rewrite the label, address and SecureOn of a favourite stored in
+    # a subnet the caller cannot see. A lookup that raises is not "absent": refuse, write nothing, audit nothing.
+    existing, lookup_failed = None, False
     db = None
     try:
         db = _get_db()
@@ -596,10 +604,13 @@ def add_favourite():
             existing = cur.fetchone()
     except Exception as e:
         logger.error(f"Wake & Actions: could not check for an existing favourite: {e}")
-        existing = None
+        lookup_failed = True
     finally:
         if db:
             db.close()
+    if lookup_failed:
+        flash(LOOKUP_REFUSAL, "error")
+        return redirect(url_for("wol.index"))
 
     current_subnet_id = _current_subnet_for_mac(mac)
     if existing:
