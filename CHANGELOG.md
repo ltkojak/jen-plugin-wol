@@ -1,5 +1,22 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.4] - 2026-10-07
+
+Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: judging a favourite and writing it are one transaction
+
+*Add favourite* read the existing row on one connection, closed it, judged the owner, and then wrote on another with
+`INSERT ... ON DUPLICATE KEY UPDATE`. A favourite another admin created or changed in the moment between the two was rewritten by the
+second statement: its label, address and SecureOn password, whatever subnet it was stored in. The route now does both on one connection:
+the row is read `FOR UPDATE` (so nobody else can change or create it until the request ends), judged on its own stored subnet, and updated
+with that owner as a predicate (`WHERE mac=... AND subnet_id <=> owner`); the count is checked, and a row that is no longer the one that was
+judged refuses with *That favourite changed while you were saving it — nothing was changed* and audits nothing. A new favourite is a plain
+`INSERT`: if another request created it first (duplicate key, or a deadlock between two inserts of one MAC) the row that won is locked and
+judged again, and one in a subnet the caller cannot see is refused, never updated. *Delete* gets the same discipline (read `FOR UPDATE`,
+delete under the judged owner, count checked). The harness interleaves a hidden-subnet row between the judgement and the write for
+add, the lost-race insert, the deadlock and delete.
+
 ## [1.1.3] - 2026-10-07
 
 Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.

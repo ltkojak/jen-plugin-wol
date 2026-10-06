@@ -205,9 +205,14 @@ def main():
 
     # ── a fake database and request, to run the impure routes ────────────────
     class FakeDB:
-        def __init__(self, selects=None):
+        def __init__(self, selects=None, hook=None):
             self.statements = []
             self.selects = list(selects or [])
+            self.rowcount = 1
+            self.rolled_back = 0
+            self.hook = (
+                hook  # called with (kind, sql, params) after the statement is recorded; may raise or set rowcount
+            )
 
         def cursor(self):
             return self
@@ -219,7 +224,14 @@ def main():
             return False
 
         def execute(self, sql, params=()):
-            self.statements.append((sql.split()[0].upper(), sql, params))
+            kind = sql.split()[0].upper()
+            self.statements.append((kind, sql, params))
+            self.rowcount = 1
+            if self.hook:
+                self.hook(self, kind, sql, params)
+
+        def rollback(self):
+            self.rolled_back += 1
 
         def fetchone(self):
             return self.selects.pop(0) if self.selects else None
@@ -312,8 +324,20 @@ def main():
         f"add_favourite: the subnet is the MAC's (1); an address in another subnet is not stored (got {insert and insert[0][2]})",
     )
     check(
-        "IF(VALUES(secureon) IS NULL, secureon, VALUES(secureon))" in insert[0][1],
+        "ON DUPLICATE" not in insert[0][1], "add_favourite: a new favourite is a plain INSERT, never an upsert (1.1.4)"
+    )
+    fdb = FakeDB([{"subnet_id": 1}])  # a re-add: the row exists, in the caller's subnet
+    p._get_db = lambda fdb=fdb: fdb
+    p.request = types.SimpleNamespace(form={"mac": "aa:bb:cc:dd:ee:01", "ip": "", "label": "x", "secureon": ""})
+    p.add_favourite()
+    upd = [s for s in fdb.statements if s[0] == "UPDATE"]
+    check(
+        len(upd) == 1 and "IF(%s IS NULL, secureon, %s)" in upd[0][1],
         "add_favourite: a blank SecureOn on a re-add keeps the stored one",
+    )
+    check(
+        "subnet_id=" not in upd[0][1].split("WHERE")[0] and "subnet_id <=> %s" in upd[0][1],
+        "add_favourite: the UPDATE never sets subnet_id and is conditioned on the judged owner",
     )
 
     # ── 1.0.1: a favourite is judged on its own row ──────────────────────────
@@ -434,7 +458,7 @@ def main():
         )
         p.add_favourite()
         check(
-            ("INSERT" in fdb.kinds()) == expect_insert,
+            ("UPDATE" in fdb.kinds()) == expect_insert,
             f"add_favourite: {label} - the A caller {'may' if expect_insert else 'may not'} edit it (got {fdb.kinds()})",
         )
     p.request = None
@@ -446,14 +470,14 @@ def main():
     p._get_db = lambda fdb=fdb: fdb
     p.request = types.SimpleNamespace(form={"mac": "aa:bb:cc:dd:ee:01", "ip": "", "label": "renamed", "secureon": ""})
     p.add_favourite()
-    insert = [s for s in fdb.statements if s[0] == "INSERT"]
+    update = [s for s in fdb.statements if s[0] == "UPDATE"]
     check(
-        len(insert) == 1 and insert[0][2][2] == 2,
-        f"add_favourite: re-adding an existing favourite keeps its STORED subnet, not the MAC's current one (got {insert and insert[0][2]})",
+        len(update) == 1 and update[0][2][-1] == 2 and "INSERT" not in fdb.kinds(),
+        f"add_favourite: re-adding an existing favourite keeps its STORED subnet, not the MAC's current one (got {update and update[0][2]})",
     )
     check(
-        "subnet_id=VALUES(subnet_id)" not in insert[0][1],
-        "add_favourite: subnet_id is not in the UPDATE clause at all",
+        "SET subnet_id" not in update[0][1] and ", subnet_id" not in update[0][1].split("WHERE")[0],
+        "add_favourite: subnet_id is not assigned by the UPDATE at all",
     )
 
     # ── 1.0.1: the wake API — a MAC with no subnet is for an unrestricted key only ─
@@ -904,6 +928,9 @@ def main():
 
     audits_h = []
     p._audit = lambda action, target, detail: audits_h.append((action, target, detail))
+    sys.modules["jen.plugin_api"].encrypt_secret = lambda s: (
+        "v1:" + s[::-1]
+    )  # the route parses SecureOn before it looks anything up
     p._require_write = lambda: True
     p._can = only_one
     p._current_subnet_for_mac = lambda mac: 1
@@ -930,6 +957,138 @@ def main():
         flaky2.calls == 1 and not flaky2.dbs,
         "add_favourite: after a failed lookup the route never even opens a second connection to write with",
     )
+
+    # ── 1.1.4: authorization and mutation are ONE transaction. A B-owned row that appears or changes between the judgement
+    #    and the write is never modified: the write is conditioned on the judged owner, the count is checked, a lost race is
+    #    re-judged on the row that WON ──
+    class _Dup(Exception):
+        pass
+
+    def duplicate(*a):
+        err = _Dup("Duplicate entry")
+        err.args = (1062, "Duplicate entry")
+        return err
+
+    def mutations(db):
+        return [k for k in db.kinds() if k in ("INSERT", "UPDATE", "DELETE")]
+
+    p._can = only_one  # the caller is an admin of subnet 1 (A); subnet 2 (B) is hidden from them
+    p._current_subnet_for_mac = lambda mac: 1
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    audits_h.clear()
+
+    # (a) judged as A's row, then the row is no longer A's when the UPDATE runs (0 rows match the owner predicate)
+    def moved_to_b(db, kind, sql, params):
+        if kind == "UPDATE":
+            db.rowcount = 0  # nothing matched "subnet_id <=> 1"
+            db.selects[:] = [{"subnet_id": 2}]  # what a look under the lock now finds
+
+    race = FakeDB([{"subnet_id": 1}], hook=moved_to_b)
+    p._get_db = lambda: race
+    flashed.clear()
+    p.request = types.SimpleNamespace(
+        form={"mac": "aa:bb:cc:dd:ee:01", "ip": "", "label": "x", "secureon": ""}, args={}
+    )
+    p.add_favourite()
+    check(
+        flashed == [p.CHANGED_UNDERFOOT] and race.rolled_back == 1 and audits_h == [],
+        f"add_favourite: the row became B's between judge and write - the request refuses, rolls back, audits nothing (flashed={flashed})",
+    )
+    # (b) the same UPDATE that changes nothing (values already stored) is a success, not a refusal
+    unchanged = FakeDB(
+        [{"subnet_id": 1}],
+        hook=lambda db, kind, sql, params: (
+            (setattr(db, "rowcount", 0), db.selects.__setitem__(slice(None), [{"subnet_id": 1}]))
+            if kind == "UPDATE"
+            else None
+        ),
+    )
+    p._get_db = lambda: unchanged
+    flashed.clear()
+    p.add_favourite()
+    check(
+        flashed and flashed[0].endswith("added to favourites.") and unchanged.rolled_back == 0,
+        f"add_favourite: a re-save of identical values (MySQL counts 0 changed rows) is still a success (flashed={flashed})",
+    )
+    # (c) a new MAC: the INSERT loses the race (1062) to a B-owned favourite - the winner is locked and judged, never overwritten
+    state = {"n": 0}
+
+    def lose_to_b(db, kind, sql, params):
+        if kind == "INSERT":
+            db.selects[:] = [{"subnet_id": 2}]  # the row that won
+            raise duplicate()
+
+    lost = FakeDB([], hook=lose_to_b)
+    p._get_db = lambda: lost
+    flashed.clear()
+    audits_h.clear()
+    p.add_favourite()
+    check(
+        mutations(lost) == ["INSERT"] and flashed == [p.NOT_YOURS] and audits_h == [],
+        f"add_favourite: lost the INSERT race to a B-owned favourite - judged again, refused, never UPDATEd (got {mutations(lost)}, {flashed})",
+    )
+
+    # (d) ... and a winner in the caller's own subnet is updated (with the owner predicate), not refused
+    def lose_to_a(db, kind, sql, params):
+        if kind == "INSERT":
+            db.selects[:] = [{"subnet_id": 1}]
+            raise duplicate()
+
+    lost_a = FakeDB([], hook=lose_to_a)
+    p._get_db = lambda: lost_a
+    flashed.clear()
+    p.add_favourite()
+    check(
+        mutations(lost_a) == ["INSERT", "UPDATE"]
+        and lost_a.statements[-1][2][-1] == 1
+        and flashed[0].endswith("added to favourites."),
+        f"add_favourite: lost the INSERT race to a favourite in the caller's own subnet - updated under the owner predicate (got {mutations(lost_a)})",
+    )
+
+    # (e) a deadlock between two inserts of one MAC (1213) rolls back and is judged again the same way
+    def deadlock(db, kind, sql, params):
+        if kind == "INSERT" and state["n"] == 0:
+            state["n"] = 1
+            err = _Dup("Deadlock found")
+            err.args = (1213, "Deadlock found")
+            db.selects[:] = [{"subnet_id": 2}]
+            raise err
+
+    dead = FakeDB([], hook=deadlock)
+    p._get_db = lambda: dead
+    flashed.clear()
+    p.add_favourite()
+    check(
+        mutations(dead) == ["INSERT"] and dead.rolled_back >= 1 and flashed == [p.NOT_YOURS],
+        f"add_favourite: a deadlocked INSERT is rolled back and the winner (B's) re-judged and refused (got {mutations(dead)}, {flashed})",
+    )
+    # (f) every SELECT that judges a row locks it
+    check(
+        all("FOR UPDATE" in s[1] for s in race.statements if s[0] == "SELECT"),
+        "add_favourite: every SELECT that judges the row is FOR UPDATE",
+    )
+
+    # (g) delete: the same discipline - FOR UPDATE, owner predicate, count checked
+    def row_gone(db, kind, sql, params):
+        if kind == "DELETE":
+            db.rowcount = 0
+
+    gone = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 1}], hook=row_gone)
+    p._get_db = lambda: gone
+    flashed.clear()
+    audits_h.clear()
+    p.delete_favourite(7)
+    dels = [s for s in gone.statements if s[0] == "DELETE"]
+    check(
+        flashed == [p.CHANGED_UNDERFOOT]
+        and audits_h == []
+        and gone.rolled_back == 1
+        and "subnet_id <=> %s" in dels[0][1]
+        and dels[0][2] == (7, 1)
+        and "FOR UPDATE" in gone.statements[0][1],
+        f"delete_favourite: FOR UPDATE, deleted under the judged owner, a count that is not 1 refuses and audits nothing (flashed={flashed})",
+    )
+
     # the control: the same call with a healthy lookup refuses too (hidden favourite), and a MAC with no favourite is added
     p._get_db = lambda: FakeDB([{"subnet_id": 2}])
     audits_h.clear()

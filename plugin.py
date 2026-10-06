@@ -532,6 +532,73 @@ def _candidate_hosts():
 
 
 LOOKUP_REFUSAL = "Could not check the existing record — nothing was changed."
+NOT_YOURS = "That MAC is not on a subnet you can access."  # the same refusal as a MAC out of scope
+CHANGED_UNDERFOOT = "That favourite changed while you were saving it — nothing was changed. Try again."
+
+
+class _LookupFailed(Exception):
+    """The existence lookup itself raised: the third outcome, neither 'found' nor 'not found' (v1.1.3)."""
+
+
+def _save_favourite(db, mac, ip, label, secureon, on_write=None):
+    """Judge and write one favourite in ONE transaction (v1.1.4). Returns ("ok", "") or ("refused", the flash text); the caller commits
+    or rolls back. Raises _LookupFailed when the first SELECT raises (the third outcome: refuse, write nothing, audit nothing).
+
+    The row is read `FOR UPDATE`, so nobody else can change or create it until this transaction ends. An existing favourite is
+    authorised on its OWN stored subnet and updated with that owner as a predicate (`subnet_id <=> owner`) - the route never moves a
+    favourite's subnet. A new one is a plain INSERT, never `ON DUPLICATE KEY UPDATE`: if another request created it first (error 1062,
+    or a deadlock 1213 between two inserts of one MAC) the row that WON is locked and judged again. `on_write` is a test hook that runs
+    after the judgement and before the write - the point where an interleaving request used to slip in."""
+    with db.cursor() as cur:
+        for attempt in (1, 2):
+            try:
+                cur.execute("SELECT subnet_id FROM wol_hosts WHERE mac=%s FOR UPDATE", (mac,))
+                existing = cur.fetchone()
+            except Exception as e:
+                raise _LookupFailed(str(e)) from e
+            if existing:
+                owner = existing["subnet_id"]
+                if not _can(owner):
+                    return "refused", NOT_YOURS
+                stored_ip = ip if ip and _derive_subnet_id(ip, _subnet_map()) == owner else ""
+                if on_write:
+                    on_write()
+                cur.execute(
+                    "UPDATE wol_hosts SET ip=%s, label=%s, secureon=IF(%s IS NULL, secureon, %s) "
+                    "WHERE mac=%s AND subnet_id <=> %s",
+                    (stored_ip or None, label, secureon, secureon, mac, owner),
+                )
+                if cur.rowcount == 1:
+                    return "ok", ""
+                # 0 rows: the values were already what is stored (MySQL counts CHANGED rows), or the row is no longer the one that
+                # was judged. Look again under the lock this transaction holds; only the same owner is a success.
+                cur.execute("SELECT subnet_id FROM wol_hosts WHERE mac=%s FOR UPDATE", (mac,))
+                again = cur.fetchone()
+                if again is not None and again["subnet_id"] == owner:
+                    return "ok", ""
+                return "refused", CHANGED_UNDERFOOT
+            # The subnet is where the MAC is (a lease or reservation), never worked out from an address the caller typed: the
+            # optional IP used to be enough to attach ANY MAC to a subnet the caller owns. A MAC Jen has never seen has no subnet
+            # and is for unrestricted callers only.
+            subnet_id = _current_subnet_for_mac(mac)
+            if not _can(subnet_id):
+                return "refused", NOT_YOURS
+            stored_ip = ip if ip and _derive_subnet_id(ip, _subnet_map()) == subnet_id else ""
+            if on_write:
+                on_write()
+            try:
+                cur.execute(
+                    "INSERT INTO wol_hosts (mac, ip, subnet_id, label, secureon) VALUES (%s, %s, %s, %s, %s)",
+                    (mac, stored_ip or None, subnet_id, label, secureon),
+                )
+                return "ok", ""
+            except Exception as e:
+                if attempt == 1 and getattr(e, "args", (None,))[0] in (1062, 1213):
+                    if getattr(e, "args", (None,))[0] == 1213:
+                        db.rollback()  # InnoDB already rolled the deadlock victim back
+                    continue  # another request created it first: lock and judge the row that won
+                raise
+    return "refused", CHANGED_UNDERFOOT
 
 
 def _where_now(mac, stored_subnet_id, subnet_map):
@@ -595,40 +662,9 @@ def add_favourite():
     # raised, so with the database failing for this one SELECT the route went on as if the MAC were new, judged it on the client's
     # CURRENT subnet and let `INSERT ... ON DUPLICATE KEY UPDATE` rewrite the label, address and SecureOn of a favourite stored in
     # a subnet the caller cannot see. A lookup that raises is not "absent": refuse, write nothing, audit nothing.
-    existing, lookup_failed = None, False
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("SELECT subnet_id FROM wol_hosts WHERE mac=%s", (mac,))
-            existing = cur.fetchone()
-    except Exception as e:
-        logger.error(f"Wake & Actions: could not check for an existing favourite: {e}")
-        lookup_failed = True
-    finally:
-        if db:
-            db.close()
-    if lookup_failed:
-        flash(LOOKUP_REFUSAL, "error")
-        return redirect(url_for("wol.index"))
-
-    current_subnet_id = _current_subnet_for_mac(mac)
-    if existing:
-        if not _can(existing["subnet_id"]):
-            flash("That MAC is not on a subnet you can access.", "error")  # the same refusal as a MAC out of scope
-            return redirect(url_for("wol.index"))
-        subnet_id = existing["subnet_id"]  # never moved by this route
-    else:
-        # The subnet is where the MAC is (a lease or reservation), never worked out from an address
-        # the caller typed: the optional IP used to be enough to attach ANY MAC to a subnet the caller
-        # owns. A MAC Jen has never seen has no subnet and is for unrestricted callers only.
-        subnet_id = current_subnet_id
-        if not _can(subnet_id):
-            flash("That MAC is not on a subnet you can access.", "error")
-            return redirect(url_for("wol.index"))
-    if ip and _derive_subnet_id(ip, _subnet_map()) != subnet_id:
-        ip = ""  # a typed address that is not in the MAC's own subnet is not stored
-
+    # v1.1.4 - and the judgement and the write are ONE transaction (`_save_favourite`): the row is read FOR UPDATE, judged, and written
+    # with its judged owner as a predicate, so a favourite another admin creates or changes between "judge" and "write" can never be
+    # rewritten by this request.
     secureon_raw = request.form.get("secureon", "").strip()
     secureon = None
     if secureon_raw:
@@ -641,22 +677,23 @@ def add_favourite():
         secureon = encrypt_secret(secureon_raw)  # encrypted at rest, like every other plugin credential
 
     db = None
+    stage = "check"
     try:
         db = _get_db()
-        with db.cursor() as cur:
-            # v1.0.3 — subnet_id is deliberately NOT in the UPDATE clause: ON DUPLICATE KEY UPDATE only
-            # touches the columns listed, so an existing row keeps the subnet_id it already had.
-            cur.execute(
-                "INSERT INTO wol_hosts (mac, ip, subnet_id, label, secureon) VALUES (%s, %s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE ip=VALUES(ip), label=VALUES(label), "
-                "secureon=IF(VALUES(secureon) IS NULL, secureon, VALUES(secureon))",
-                (mac, ip or None, subnet_id, label, secureon),
-            )
+        outcome, refusal = _save_favourite(db, mac, ip, label, secureon)
+        stage = "write"
+        if outcome != "ok":
+            db.rollback()
+            flash(refusal, "error")
+            return redirect(url_for("wol.index"))
         db.commit()
         flash(f"{label or mac} added to favourites.", "success")
         _audit("WOL_ADD_FAVOURITE", mac, f"label={label}")
+    except _LookupFailed as e:
+        logger.error(f"Wake & Actions: could not check for an existing favourite: {e}")
+        flash(LOOKUP_REFUSAL, "error")
     except Exception as e:
-        logger.error(f"Wake & Actions: could not add favourite: {e}")
+        logger.error(f"Wake & Actions: could not add favourite ({stage}): {e}")
         flash("Could not add the favourite; the details are in Jen's log.", "error")
     finally:
         if db:
@@ -673,7 +710,8 @@ def delete_favourite(host_id):
     try:
         db = _get_db()
         with db.cursor() as cur:
-            cur.execute("SELECT mac, subnet_id FROM wol_hosts WHERE id=%s", (host_id,))
+            # v1.1.4: read FOR UPDATE, judged on its OWN subnet, deleted with that owner as a predicate and the count checked
+            cur.execute("SELECT mac, subnet_id FROM wol_hosts WHERE id=%s FOR UPDATE", (host_id,))
             row = cur.fetchone()
             if row is None:
                 flash("Favourite not found.", "error")
@@ -681,7 +719,11 @@ def delete_favourite(host_id):
             if not _can(row["subnet_id"]):  # a stored object: its own subnet, never where the MAC is now
                 flash("Favourite not found.", "error")
                 return redirect(url_for("wol.index"))
-            cur.execute("DELETE FROM wol_hosts WHERE id=%s", (host_id,))
+            cur.execute("DELETE FROM wol_hosts WHERE id=%s AND subnet_id <=> %s", (host_id, row["subnet_id"]))
+            if cur.rowcount != 1:
+                db.rollback()
+                flash(CHANGED_UNDERFOOT, "error")
+                return redirect(url_for("wol.index"))
         db.commit()
         flash("Favourite removed.", "success")
         _audit("WOL_DELETE_FAVOURITE", str(host_id), "favourite removed")
