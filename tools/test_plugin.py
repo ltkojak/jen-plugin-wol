@@ -343,34 +343,101 @@ def main():
     check("DELETE" in fdb.kinds(), "delete_favourite: an unrestricted caller removes any favourite")
     p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
 
-    # ── 1.0.3: a favourite is judged on where its MAC is NOW, stored only as a fallback ──
+    # ── 1.1.2: a favourite is a STORED object - judged on its OWN subnet; the wake on where the host is NOW ──
     p._can = only_one
-    # stored subnet 1 (the caller's own), but the MAC has since moved to subnet 2
+    # stored in the caller's subnet 1, the MAC has since moved to subnet 2: the favourite is still theirs to edit and delete
     p._current_subnet_for_mac = lambda mac: 2
     fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 1}])
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favourite(5)
     check(
-        "DELETE" not in fdb.kinds(),
-        "delete_favourite: a favourite that MOVED out of the caller's subnet is not theirs any more",
+        "DELETE" in fdb.kinds(),
+        "delete_favourite: stored in A, host now in B - the favourite is still the A caller's to remove",
     )
+    # ...but not theirs to WAKE: the host is now on a network they cannot see, so nothing is sent
     fdb = FakeDB([{"subnet_id": 1, "secureon": None, "label": "x", "mac": "aa:bb:cc:dd:ee:01"}])
     p._get_db = lambda fdb=fdb: fdb
     sent.clear()
     p.wake_favourite(5)
     check(
-        sent == [],
-        f"wake_favourite: a favourite that MOVED out of the caller's subnet cannot be woken by them (got {sent})",
+        sent == [] and flashed[-1] == "That MAC is not on a subnet you can access.",
+        f"wake_favourite: stored in A, host now in B - the A caller cannot wake it (got {sent}, {flashed[-1]!r})",
     )
-    # and the reverse: stored subnet 2 (not the caller's), but the MAC is now in the caller's subnet 1
+    # the leak direction: stored in subnet 2 (not the caller's), the MAC is now in the caller's subnet 1
     p._current_subnet_for_mac = lambda mac: 1
     fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}])
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favourite(5)
     check(
-        "DELETE" in fdb.kinds(),
-        "delete_favourite: a favourite that moved INTO the caller's subnet is now theirs",
+        "DELETE" not in fdb.kinds() and flashed[-1] == "Favourite not found.",
+        "delete_favourite: stored in B, host now in A - not found for the A caller, nothing deleted",
     )
+    fdb = FakeDB([{"subnet_id": 2, "secureon": "aa:bb:cc:dd", "label": "x", "mac": "aa:bb:cc:dd:ee:01"}])
+    p._get_db = lambda fdb=fdb: fdb
+    sent.clear()
+    p._last_sent.clear()
+    p.wake_favourite(5)
+    check(
+        sent == [] and flashed[-1] == "Favourite not found.",
+        f"wake_favourite: stored in B, host now in A - not found for the A caller, nothing sent (got {sent})",
+    )
+    p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
+
+    # a favourite in the caller's own subnet, the host still there: the wake goes, with the favourite's SecureOn
+    p._current_subnet_for_mac = lambda mac: 1
+    fdb = FakeDB([{"subnet_id": 1, "secureon": "aa:bb:cc:dd", "label": "x", "mac": "aa:bb:cc:dd:ee:01"}])
+    p._get_db = lambda fdb=fdb: fdb
+    sent.clear()
+    p._last_sent.clear()
+    p.wake_favourite(5)
+    check(
+        len(sent) == 1 and sent[0][1] == "10.1.0.0/24" and sent[0][2] == bytes.fromhex("aabbccdd"),
+        f"wake_favourite: stored in A, host in A - sent on A with the favourite's own SecureOn (got {sent})",
+    )
+    p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
+
+    # the pure judgement: a wake and a stored favourite are two questions
+    fav_b = {"subnet_id": 2, "secureon": "aa:bb:cc:dd"}
+    fav_a = {"subnet_id": 1, "secureon": "aa:bb:cc:dd"}
+    check(
+        p.wake_inputs(fav_b, 1, only_one) == (1, None),
+        "wake_inputs: stored in B, host now in A, an A caller - the wake goes on A and carries NO password",
+    )
+    check(
+        p.wake_inputs(fav_a, 2, only_one) == (2, "aa:bb:cc:dd"),
+        "wake_inputs: stored in A, host now in B - the favourite's password is the A caller's; the caller's scope then refuses B",
+    )
+    check(
+        p.wake_inputs(fav_b, None, only_one) == (None, None)
+        and p.wake_inputs(fav_a, None, only_one) == (1, "aa:bb:cc:dd"),
+        "wake_inputs: a host with no current subnet falls back to the stored one only for a favourite the caller may see",
+    )
+    check(
+        p.wake_inputs({"subnet_id": None, "secureon": "x"}, 1, only_one) == (1, None)
+        and p.wake_inputs({"subnet_id": None, "secureon": "x"}, 1, everything) == (1, "x")
+        and p.wake_inputs(None, 1, only_one) == (1, None),
+        "wake_inputs: a favourite with no subnet is for an unrestricted caller only; no favourite, no password",
+    )
+
+    # add over an existing favourite: judged on the STORED subnet, both directions
+    for label, stored, now, expect_insert in (
+        ("stored in B, host now in A (the leak direction)", 2, 1, False),
+        ("stored in A, host now in B", 1, 2, True),
+        ("stored in A, host still in A", 1, 1, True),
+    ):
+        p._can = only_one
+        p._current_subnet_for_mac = lambda mac, now=now: now
+        fdb = FakeDB([{"subnet_id": stored}])
+        p._get_db = lambda fdb=fdb: fdb
+        p.request = types.SimpleNamespace(
+            form={"mac": "aa:bb:cc:dd:ee:01", "ip": "", "label": "renamed", "secureon": ""}
+        )
+        p.add_favourite()
+        check(
+            ("INSERT" in fdb.kinds()) == expect_insert,
+            f"add_favourite: {label} - the A caller {'may' if expect_insert else 'may not'} edit it (got {fdb.kinds()})",
+        )
+    p.request = None
     p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
 
     # ── 1.0.3: add_favourite never moves an existing favourite's subnet ──────
@@ -447,6 +514,83 @@ def main():
     )
     p.request = None
     sys.modules["flask"].request = None
+
+    # the never-built-into-a-packet test: a hidden favourite's SecureOn must not reach build_magic_packet, on any wake path
+    built = []
+    real_build = p.build_magic_packet
+
+    def spy_build(mac, secureon=None):
+        built.append(secureon)
+        return real_build(mac, secureon)
+
+    class _Sock:
+        def setsockopt(self, *a):
+            pass
+
+        def sendto(self, packet, addr):
+            pass
+
+        def close(self):
+            pass
+
+    real_socket_mod = p.socket
+    p.build_magic_packet = spy_build
+    p.socket = types.SimpleNamespace(AF_INET=2, SOCK_DGRAM=2, SOL_SOCKET=1, SO_BROADCAST=6, socket=lambda *a: _Sock())
+    import importlib.util as _ilu
+
+    _spec = _ilu.spec_from_file_location("wol_plugin_raw", os.path.join(ROOT, "plugin.py"))
+    _raw = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_raw)
+    p._send_wake = types.FunctionType(_raw._send_wake.__code__, p.__dict__)  # the real one; the harness had stubbed it
+    try:
+        hidden = bytes.fromhex("aabbccdd")
+        p._can = only_one
+        p._current_subnet_for_mac = lambda mac: 1  # the host is in the caller's subnet; the favourite was saved in B
+        p.request = types.SimpleNamespace(args={"mac": "aa:bb:cc:dd:ee:01"})
+        p._last_sent.clear()
+        p._get_db = lambda: FakeDB([{"subnet_id": 2, "secureon": "aa:bb:cc:dd"}, None])
+        p.wake_from_row()
+        check(
+            built and hidden not in built,
+            f"wake_from_row: a hidden favourite's SecureOn is never built into the packet (got {built})",
+        )
+        built.clear()
+        p._last_sent.clear()
+        sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": [1]})
+        sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True: {"mac": "aa:bb:cc:dd:ee:01"})
+        p._get_db = lambda: FakeDB([{"subnet_id": 2, "secureon": "aa:bb:cc:dd"}, None])
+        result = p._api_wake()
+        check(
+            result == {"ok": True, "mac": "aa:bb:cc:dd:ee:01"} and built and hidden not in built,
+            f"_api_wake: a scoped key does not use a hidden favourite's SecureOn either (got {result}, {built})",
+        )
+        # the control: a favourite the caller may see DOES supply its password
+        built.clear()
+        p._last_sent.clear()
+        p._get_db = lambda: FakeDB([{"subnet_id": 1, "secureon": "aa:bb:cc:dd"}, None])
+        p._api_wake()
+        check(built == [hidden], f"_api_wake: a favourite in the key's own scope supplies its SecureOn (got {built})")
+        built.clear()
+        p._last_sent.clear()
+        p.request = types.SimpleNamespace(args={"mac": "aa:bb:cc:dd:ee:01"})
+        p._get_db = lambda: FakeDB([{"subnet_id": 1, "secureon": "aa:bb:cc:dd"}, None])
+        p.wake_from_row()
+        check(built == [hidden], f"wake_from_row: ...and so does a session caller's own (got {built})")
+        # the wake from the list, hidden favourite: refused before any packet
+        built.clear()
+        p._last_sent.clear()
+        p._get_db = lambda: FakeDB(
+            [{"subnet_id": 2, "secureon": "aa:bb:cc:dd", "label": "x", "mac": "aa:bb:cc:dd:ee:01"}]
+        )
+        p.wake_favourite(5)
+        check(built == [], f"wake_favourite: a hidden favourite builds no packet at all (got {built})")
+    finally:
+        p.build_magic_packet = real_build
+        p.socket = real_socket_mod
+        p._send_wake = lambda mac, cidr, secureon: sent.append((mac, cidr, secureon))
+        p.request = None
+        sys.modules["flask"].request = None
+        p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
 
     # ── 1.0.1: sending prunes the rate map ───────────────────────────────────
     p._last_sent.clear()
@@ -548,21 +692,48 @@ def main():
         "_current_subnet_for_mac: answered by plugin_api.client_subnet_for_mac, not a private copy",
     )
 
-    # ── 1.0.3: the favourites list is judged on the MAC's CURRENT subnet ─────
+    # ── 1.1.2: the favourites list is judged on each favourite's STORED subnet ─
     p._can = only_one
     p._favourite_rows = lambda: [
-        {"id": 1, "mac": "aa:bb:cc:dd:ee:01", "ip": "10.1.0.5", "subnet_id": 2, "label": "moved-in", "secureon": None},
+        {
+            "id": 1,
+            "mac": "aa:bb:cc:dd:ee:01",
+            "ip": "10.1.0.5",
+            "subnet_id": 2,
+            "label": "moved-in",
+            "secureon": "v1:s",
+        },
         {"id": 2, "mac": "aa:bb:cc:dd:ee:02", "ip": "10.2.0.5", "subnet_id": 1, "label": "moved-out", "secureon": None},
+        {"id": 3, "mac": "aa:bb:cc:dd:ee:03", "ip": None, "subnet_id": None, "label": "no-subnet", "secureon": None},
     ]
-    p._current_subnet_for_mac = lambda mac: {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}[mac]
+    p._current_subnet_for_mac = lambda mac: {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2, "aa:bb:cc:dd:ee:03": 1}[
+        mac
+    ]
     p._subnet_map = lambda: {1: {"name": "A", "cidr": "10.1.0.0/24"}, 2: {"name": "B", "cidr": "10.2.0.0/24"}}
     p.render_template = lambda name, **kw: kw
     page = p.index()
     check(
-        [r["label"] for r in page["rows"]] == ["moved-in"],
-        f"index: judged on the MAC's current subnet, not the stale stored one (got {[r['label'] for r in page['rows']]})",
+        [r["label"] for r in page["rows"]] == ["moved-out"],
+        f"index: stored in B (host now in A) and no-subnet are not listed for an A caller; stored in A (host now in B) is "
+        f"(got {[r['label'] for r in page['rows']]})",
     )
-    check(page["rows"][0]["subnet_name"] == "A", "index: the shown subnet name is the current one too")
+    check(
+        page["rows"][0]["subnet_name"] == "A" and page["rows"][0]["now_in"] == "",
+        "index: the shown subnet is the STORED one, and a host now in a subnet the caller cannot see is not named",
+    )
+    p._can = lambda sid: sid in (1, 2)
+    both = p.index()
+    check(
+        {r["label"]: r["now_in"] for r in both["rows"]}
+        == {"moved-in": "A (10.1.0.0/24)", "moved-out": "B (10.2.0.0/24)"},
+        f"index: a caller who may see both is told where each host is now (got {[(r['label'], r['now_in']) for r in both['rows']]})",
+    )
+    p._can = everything
+    check(
+        sorted(r["label"] for r in p.index()["rows"]) == ["moved-in", "moved-out", "no-subnet"],
+        "index: an unrestricted caller sees every favourite, the one with no subnet included",
+    )
+    p._can = only_one
 
     # ── 1.0.2: a failed send does not put the exception text on the page ─────
     p._last_sent.clear()

@@ -1,5 +1,30 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.2] - 2026-10-06
+
+Fix: the rule 1.1.1 applied to the Investigation card now applies to every surface of the plugin. No change to what Jen needs:
+`requires_jen` stays 5.68.0.
+
+### Fixed: a favourite is judged by its stored subnet on the page, in add and delete, and in the wake
+
+1.1.1 stopped the Investigation card from judging a favourite by where its MAC is now, and left the rest of the plugin as it
+was. The favourites list, "Add favourite" over an existing MAC, delete, and the wake from a favourite all still judged the row
+on the MAC's current subnet with the stored one as a fallback, so a favourite saved in subnet B (its label, whether a SecureOn
+password is set) listed for a caller scoped to A once the client moved to A, and that caller could rewrite its label, address
+and SecureOn password or delete it. A favourite is a stored object and is now judged on its own stored subnet everywhere; a
+favourite with no subnet is for an unrestricted caller only. Where the host is now appears on the list as *now in …* only when
+the caller may see that subnet.
+
+### Fixed: a wake never borrows a favourite's SecureOn password the caller may not see
+
+A wake is an act on a live host and is still judged on where the host is now — that is the network the packet is sent to. But
+the wake from a row (the *Wake* row action) and the wake API read the stored favourite's SecureOn password first and judged the
+subnet afterwards, so a caller scoped to A waking a host now in A used a hidden favourite's password stored in B, and an API key
+did the same. The password is now read for a wake only when the favourite's own stored subnet is in the caller's scope (the
+session's, or the key's for the API); a favourite out of scope contributes nothing to the wake, neither its password nor its
+stored subnet as a fallback, so the wake goes ahead without it and a NIC that wants the password ignores the packet. Waking from
+the favourites list needs both: the favourite in scope by its stored subnet, and the host's current subnet in scope.
+
 ## [1.1.1] - 2026-10-06
 
 Fix to the investigation provider added in 1.1.0. No change to what Jen needs: `requires_jen` stays 5.68.0.

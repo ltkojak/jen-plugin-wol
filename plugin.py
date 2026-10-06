@@ -219,34 +219,46 @@ def _current_subnet_for_mac(mac):
     return client_subnet_for_mac(mac)
 
 
-def _wake_subject(mac):
-    """(subnet_id, secureon) — what a wake of `mac` is judged and sent on. The subnet is the
-    one the MAC is in NOW (a lease, then a reservation); a MAC with neither falls back to the
-    subnet stored on its favourite, which whoever added it had to be allowed to see. A value in
-    the request is never the subject: the row action used to pass `subnet_id` in the query
-    string and the route authorised THAT, while the packet always also went out on the limited
-    broadcast to the Jen host's own segment — so naming a subnet you own woke any host."""
-    secureon, stored_subnet = None, None
+def wake_inputs(favourite, current_subnet_id, can):
+    """Pure: (subnet_id, secureon) a wake of one MAC is judged and sent with - TWO judgements, kept apart (v1.1.2).
+
+    A WAKE is an act on a live host, so it goes where the host is now: `current_subnet_id`, and the caller needs that subnet.
+    A favourite is a STORED object, judged on its own stored subnet and nothing else: `can(favourite subnet)` decides whether
+    the caller may use anything it holds, and the SecureOn password is the thing it holds that matters most. A favourite the
+    caller may not see contributes NOTHING to the wake - not its password (a hidden favourite's secret is never built into a
+    packet the caller asked for), and not its stored subnet as a fallback - so the wake goes ahead without it and a NIC that
+    wants the password simply ignores it; no word of the favourite reaches the caller. A MAC with no current subnet falls back
+    to the stored subnet only of a favourite the caller may see."""
+    visible = bool(favourite) and bool(can(favourite.get("subnet_id")))
+    subnet_id = current_subnet_id
+    if subnet_id is None and visible:
+        subnet_id = favourite.get("subnet_id")
+    return subnet_id, (favourite.get("secureon") if visible else None)
+
+
+def _wake_subject(mac, can=None):
+    """(subnet_id, secureon) - what a wake of `mac` is judged and sent on (see `wake_inputs`). `can` is the caller's own
+    predicate on a subnet id: the session user's `_can` by default, the API key's for the API. A value in the request is
+    never the subject: the row action used to pass `subnet_id` in the query string and the route authorised THAT, while the
+    packet always also went out on the limited broadcast to the Jen host's own segment - so naming a subnet you own woke any
+    host."""
+    can = can or _can
+    favourite = None
     db = None
     try:
         db = _get_db()
         with db.cursor() as cur:
             cur.execute("SELECT subnet_id, secureon FROM wol_hosts WHERE mac=%s", (mac,))
-            row = cur.fetchone()
-            if row:
-                secureon, stored_subnet = row.get("secureon"), row.get("subnet_id")
+            favourite = cur.fetchone()
     except Exception as e:
-        # v1.0.3 — this used to have no except at all: a DB failure propagated uncaught into a 500
-        # page. Best-effort now: the wake is judged on the CURRENT subnet alone (still safe — never
+        # v1.0.3 - this used to have no except at all: a DB failure propagated uncaught into a 500
+        # page. Best-effort now: the wake is judged on the CURRENT subnet alone (still safe - never
         # more permissive than before) and the caller gets a real answer instead of a crash.
         logger.error(f"Wake & Actions: could not read the favourite for {mac}: {e}")
     finally:
         if db:
             db.close()
-    subnet_id = _current_subnet_for_mac(mac)
-    if subnet_id is None:
-        subnet_id = stored_subnet
-    return subnet_id, secureon
+    return wake_inputs(favourite, _current_subnet_for_mac(mac), can)
 
 
 # ── Sending (impure: socket) ─────────────────────────────────────────────────
@@ -519,27 +531,34 @@ def _candidate_hosts():
     return out
 
 
+def _where_now(mac, stored_subnet_id, subnet_map):
+    """The subnet the MAC is in NOW, as text, for a favourite stored in `stored_subnet_id` - "" when it has not moved, is not
+    known, or is a subnet the caller may not see (naming a subnet is access to it). Only ever shown; it decides nothing."""
+    try:
+        current = _current_subnet_for_mac(mac)
+    except Exception as e:
+        logger.error(f"Wake & Actions: could not work out where {mac} is now: {e}")
+        return ""
+    if current is None or current == stored_subnet_id or not _can(current):
+        return ""
+    return subnet_label(current, subnet_map)
+
+
 @bp.route("/")
 @login_required
 def index():
-    # v1.0.3 — judged on the MAC's CURRENT subnet (Jen's one precedence: client_subnet_for_mac), the
-    # stored value only as a fallback when a MAC has none right now. A stored subnet_id is a cache
-    # from whenever the favourite was added; a MAC that has since moved to a subnet an admin cannot
-    # see must not still be listed for (or wakeable by) that admin, the way Presence already judges
-    # a tracked device — trusting the stored value alone is what let it.
-    rows = []
-    for r in _favourite_rows():
-        subnet_id = _current_subnet_for_mac(r["mac"])
-        if subnet_id is None:
-            subnet_id = r["subnet_id"]
-        if not _can(subnet_id):
-            continue
-        r["effective_subnet_id"] = subnet_id
-        rows.append(r)
+    # v1.1.2 - a favourite is a STORED object, judged on the subnet it was stored in and nothing else
+    # (v1.0.3 judged it on where the MAC is now, the stored value only a fallback: a favourite saved in
+    # subnet B - its label, whether a SecureOn password is set - listed for an A-scoped admin the moment
+    # the client's lease moved to A). Where the MAC is now is shown as a fact, only when it is a subnet
+    # the caller may see, and never widens what they are shown.
+    rows = [r for r in _favourite_rows() if _can(r["subnet_id"])]
     subnet_map = _subnet_map()
     for r in rows:
-        sid = r["effective_subnet_id"]
+        sid = r["subnet_id"]
+        r["effective_subnet_id"] = sid
         r["subnet_name"] = subnet_map.get(sid, {}).get("name", "") if sid else "—"
+        r["now_in"] = _where_now(r["mac"], sid, subnet_map)
         r["has_secureon"] = bool(r.get("secureon"))
     return render_template(
         "wol/index.html",
@@ -562,12 +581,13 @@ def add_favourite():
     ip = request.form.get("ip", "").strip()[:15]
     label = request.form.get("label", "").strip()[:100]
 
-    # v1.0.3 — "Add Favourite" for a MAC that already has one used to judge access on the MAC's
+    # v1.0.3 - "Add Favourite" for a MAC that already has one used to judge access on the MAC's
     # CURRENT subnet alone and then overwrite the existing row's subnet_id/ip/label. An admin who can
     # see where the MAC is NOW could silently take over (and relocate) a favourite another admin had
-    # created in a subnet they cannot see. The existing row, if any, is authorised on ITS OWN subject
-    # (current subnet, its own stored value as the fallback) before anything is written, and this
-    # route never moves a favourite's subnet — Presence's model for the same shape of bug.
+    # created in a subnet they cannot see. v1.1.2: the existing row, if any, is a STORED object and is
+    # authorised on its OWN stored subnet and nothing else (v1.0.3 let the MAC's current subnet stand in
+    # for it, so a favourite saved in B was editable from A the moment the client moved to A) before
+    # anything is written, and this route never moves a favourite's subnet.
     db = None
     try:
         db = _get_db()
@@ -583,9 +603,8 @@ def add_favourite():
 
     current_subnet_id = _current_subnet_for_mac(mac)
     if existing:
-        subject_subnet_id = current_subnet_id if current_subnet_id is not None else existing["subnet_id"]
-        if not _can(subject_subnet_id):
-            flash("That MAC is not on a subnet you can access.", "error")
+        if not _can(existing["subnet_id"]):
+            flash("That MAC is not on a subnet you can access.", "error")  # the same refusal as a MAC out of scope
             return redirect(url_for("wol.index"))
         subnet_id = existing["subnet_id"]  # never moved by this route
     else:
@@ -648,10 +667,7 @@ def delete_favourite(host_id):
             if row is None:
                 flash("Favourite not found.", "error")
                 return redirect(url_for("wol.index"))
-            subject_subnet_id = _current_subnet_for_mac(row["mac"])
-            if subject_subnet_id is None:
-                subject_subnet_id = row["subnet_id"]
-            if not _can(subject_subnet_id):
+            if not _can(row["subnet_id"]):  # a stored object: its own subnet, never where the MAC is now
                 flash("Favourite not found.", "error")
                 return redirect(url_for("wol.index"))
             cur.execute("DELETE FROM wol_hosts WHERE id=%s", (host_id,))
@@ -681,20 +697,19 @@ def wake_favourite(host_id):
     finally:
         if db:
             db.close()
-    if not row:
+    # v1.1.2 - two judgements, in this order. The favourite is a STORED object: it must be in the caller's scope
+    # by its own stored subnet, or it is "not found" (and its SecureOn password is never touched). The WAKE is an
+    # act on a live host and goes where the host is now (the stored subnet only when the MAC has no current one), and
+    # the caller needs THAT subnet too: a favourite saved in A for a host that has moved to a subnet the caller
+    # cannot see is theirs to list and edit, and not theirs to wake.
+    if not row or not _can(row["subnet_id"]):
         flash("Favourite not found.", "error")
         return redirect(url_for("wol.index"))
-    # v1.0.3 — judged (and sent) on the MAC's CURRENT subnet, the stored value only a fallback: the
-    # stored subnet_id is a cache from whenever the favourite was added, and a MAC that has since
-    # moved must be judged on where it is now, the same rule _wake_subject already applies to
-    # wake_from_row/_api_wake.
-    subnet_id = _current_subnet_for_mac(row["mac"])
-    if subnet_id is None:
-        subnet_id = row["subnet_id"]
+    subnet_id, secureon = wake_inputs(row, _current_subnet_for_mac(row["mac"]), _can)
     if not _can(subnet_id):
-        flash("Favourite not found.", "error")
+        flash("That MAC is not on a subnet you can access.", "error")
         return redirect(url_for("wol.index"))
-    ok, err = _wake_mac(row["mac"], subnet_id, row.get("secureon"), current_user.username)
+    ok, err = _wake_mac(row["mac"], subnet_id, secureon, current_user.username)
     flash(f"Wake packet sent to {row.get('label') or row['mac']}." if ok else err, "success" if ok else "error")
     return redirect(url_for("wol.index"))
 
@@ -748,7 +763,10 @@ def _api_wake():
     mac = _normalize_mac(str_field(body, "mac"))
     if not mac:
         return jsonify({"error": "invalid mac"}), 400
-    subnet_id, secureon = _wake_subject(mac)
+    # v1.1.2 - the same two judgements as the page, with the KEY as the caller: the wake goes where the host is now
+    # and the key needs that subnet; a stored favourite's SecureOn is used only when the key may see the favourite's own
+    # stored subnet
+    subnet_id, secureon = _wake_subject(mac, lambda sid: api_key_can_access_subnet(g.api_key, sid))
     # a MAC with no attributable subnet is for an unrestricted key only — a scoped key read it as "allow"
     if not api_key_can_access_subnet(g.api_key, subnet_id):
         return jsonify({"error": "subnet not accessible to this key"}), 403

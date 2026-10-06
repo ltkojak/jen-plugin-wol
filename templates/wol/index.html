@@ -41,7 +41,7 @@
             {{ r.label or r.mac }}
             {% if r.label %}<span class="small muted mono">({{ r.mac }})</span>{% endif %}
         </td>
-        <td data-m="hide">{{ r.subnet_name }}</td>
+        <td data-m="hide">{{ r.subnet_name }}{% if r.now_in %} <span class="small muted">now in {{ r.now_in }}</span>{% endif %}</td>
         <td data-m="hide">{{ icon("shield") if r.has_secureon else '—' }}</td>
         <td class="small muted" data-m="hide">
             {% if r.last_woken_at %}{{ r.last_woken_at | utcfmt }}{% if r.last_woken_by %} by {{ r.last_woken_by }}{% endif %}{% else %}never{% endif %}
