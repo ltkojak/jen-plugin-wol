@@ -1106,8 +1106,26 @@ def main():
     flashed.clear()
     p.add_favourite()
     check(
-        audits_h == [] and flashed == ["That MAC is not on a subnet you can access."],
-        f"add_favourite: a new favourite for a MAC in no subnet the caller can see keeps the MAC sentence (got {flashed})",
+        audits_h == [] and flashed == [p.NOT_YOURS],
+        f"add_favourite: a new favourite for a MAC in no subnet the caller can see is the SAME sentence as a hidden favourite (got {flashed})",
+    )
+    # 1.1.6: a hidden existing favourite (stored in subnet 2) and no favourite at all for a MAC whose subnet is hidden: ONE answer, nothing audited
+    p._current_subnet_for_mac = lambda mac: 2
+    answers = []
+    for scripted in ([{"subnet_id": 2}], [None]):
+        p._get_db = lambda scripted=scripted: FakeDB(list(scripted))
+        audits_h.clear()
+        flashed.clear()
+        p.add_favourite()
+        answers.append((tuple(flashed), audits_h == []))
+    check(
+        answers == [((p.NOT_YOURS,), True), ((p.NOT_YOURS,), True)],
+        f"add_favourite: a hidden favourite and a hidden MAC are one refusal (got {answers})",
+    )
+    p._current_subnet_for_mac = lambda mac: 1
+    check(
+        p.MAC_NOT_YOURS == "That MAC is not on a subnet you can access." and p.MAC_NOT_YOURS != p.NOT_YOURS,
+        "MAC_NOT_YOURS stays the wake's sentence",
     )
     p._current_subnet_for_mac = lambda mac: 1
     check(

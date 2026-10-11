@@ -1,5 +1,20 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.6] - 2026-10-11
+
+Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: saving a favourite has one refusal, whether the favourite exists or not
+
+1.1.5 stopped telling a caller that a favourite they could not see was "not on a subnet you can access", and said instead that the favourite
+was not theirs. It left a second sentence for the other way a save is refused: a MAC with no favourite at all, in a subnet the caller cannot see.
+Two sentences for one refusal is a question the caller can ask: save over a MAC and read which sentence comes back, and you know whether
+somebody else already has a favourite for it. `_save_favourite` now returns *That favourite is not yours to change.* in both cases, and writes and
+audits nothing in either. Waking a host probes no stored object, so a wake of a MAC the caller cannot see keeps *That MAC is not on a subnet
+you can access.*, which is true there.
+
+The harness runs the two refusals through the real function against its fake database and requires the same answer from both.
+
 ## [1.1.5] - 2026-10-11
 
 Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.

@@ -592,7 +592,10 @@ def _save_favourite(db, mac, ip, label, secureon, on_write=None):
             # and is for unrestricted callers only.
             subnet_id = _current_subnet_for_mac(mac)
             if not _can(subnet_id):
-                return "refused", MAC_NOT_YOURS
+                # 1.1.6: the SAME sentence as a hidden existing favourite. Saving is a write to the favourites list, so what it refuses is "that favourite", whether the
+                # row exists (stored in a subnet the caller cannot see) or would have to be created for a MAC in one - two sentences told a scoped caller which MACs have
+                # a hidden favourite. A WAKE probes no stored object and keeps MAC_NOT_YOURS.
+                return "refused", NOT_YOURS
             stored_ip = ip if ip and _derive_subnet_id(ip, _subnet_map()) == subnet_id else ""
             if on_write:
                 on_write()
