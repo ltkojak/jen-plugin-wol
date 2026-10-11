@@ -424,22 +424,22 @@ def main():
     fav_b = {"subnet_id": 2, "secureon": "aa:bb:cc:dd"}
     fav_a = {"subnet_id": 1, "secureon": "aa:bb:cc:dd"}
     check(
-        p.wake_inputs(fav_b, 1, only_one) == (1, None),
+        p.wake_inputs(fav_b, 1, only_one) == (1, None, False),
         "wake_inputs: stored in B, host now in A, an A caller - the wake goes on A and carries NO password",
     )
     check(
-        p.wake_inputs(fav_a, 2, only_one) == (2, "aa:bb:cc:dd"),
+        p.wake_inputs(fav_a, 2, only_one) == (2, "aa:bb:cc:dd", True),
         "wake_inputs: stored in A, host now in B - the favourite's password is the A caller's; the caller's scope then refuses B",
     )
     check(
-        p.wake_inputs(fav_b, None, only_one) == (None, None)
-        and p.wake_inputs(fav_a, None, only_one) == (1, "aa:bb:cc:dd"),
+        p.wake_inputs(fav_b, None, only_one) == (None, None, False)
+        and p.wake_inputs(fav_a, None, only_one) == (1, "aa:bb:cc:dd", True),
         "wake_inputs: a host with no current subnet falls back to the stored one only for a favourite the caller may see",
     )
     check(
-        p.wake_inputs({"subnet_id": None, "secureon": "x"}, 1, only_one) == (1, None)
-        and p.wake_inputs({"subnet_id": None, "secureon": "x"}, 1, everything) == (1, "x")
-        and p.wake_inputs(None, 1, only_one) == (1, None),
+        p.wake_inputs({"subnet_id": None, "secureon": "x"}, 1, only_one) == (1, None, False)
+        and p.wake_inputs({"subnet_id": None, "secureon": "x"}, 1, everything) == (1, "x", True)
+        and p.wake_inputs(None, 1, only_one) == (1, None, False),
         "wake_inputs: a favourite with no subnet is for an unrestricted caller only; no favourite, no password",
     )
 
@@ -1095,9 +1095,111 @@ def main():
     flashed.clear()
     p.add_favourite()
     check(
-        audits_h == [] and flashed == ["That MAC is not on a subnet you can access."],
-        "add_favourite: the healthy lookup refuses a hidden favourite",
+        audits_h == [] and flashed == ["That favourite is not yours to change."],
+        f"add_favourite: the healthy lookup refuses a hidden favourite with a sentence that says nothing about the MAC (got {flashed})",
     )
+    # 1.1.5: the MAC the caller CAN see, with a hidden favourite, is told only that the favourite is not theirs; a MAC the caller
+    # cannot see at all and that has no favourite keeps its own (true) sentence. Neither text names a MAC, a subnet or a label.
+    p._current_subnet_for_mac = lambda mac: 2
+    p._get_db = lambda: FakeDB([None])
+    audits_h.clear()
+    flashed.clear()
+    p.add_favourite()
+    check(
+        audits_h == [] and flashed == ["That MAC is not on a subnet you can access."],
+        f"add_favourite: a new favourite for a MAC in no subnet the caller can see keeps the MAC sentence (got {flashed})",
+    )
+    p._current_subnet_for_mac = lambda mac: 1
+    check(
+        p.NOT_YOURS == "That favourite is not yours to change." and "MAC" not in p.NOT_YOURS,
+        "NOT_YOURS: exactly the favourite sentence, no claim about the MAC",
+    )
+
+    # ── 1.1.5: a wake stamps last_woken_* only on a favourite the caller may see ──
+    def stamps(db):
+        return [s for s in db.statements if s[0] == "UPDATE" and "last_woken_at" in s[1]]
+
+    p._can = only_one
+    p._current_subnet_for_mac = lambda mac: 1  # the host is in the caller's subnet
+    p._require_write = lambda: True
+    p.current_user.username = "admin_A"
+    p._send_wake = lambda mac, cidr, secureon: sent.append((mac, cidr, secureon))  # an earlier check left a failing one
+    jen_api_now = types.ModuleType("jen.plugin_api")
+    jen_api_now.normalize_mac = _stub_normalize_mac
+    jen_api_now.json_object_body = _stub_json_object_body
+    jen_api_now.str_field = _stub_str_field
+    jen_api_now.api_key_can_access_subnet = lambda key, sid, **k: sid in (key.get("subnet_ids") or [sid])
+    sys.modules["jen.plugin_api"] = jen_api_now
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": [1]})
+    sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True: {"mac": "aa:bb:cc:dd:ee:01"})
+    mac1 = "aa:bb:cc:dd:ee:01"
+
+    def run_row(favourite):
+        db = FakeDB([favourite, None] if favourite else [None, None])
+        p._get_db = lambda: db
+        p.request = types.SimpleNamespace(args={"mac": mac1})
+        sent.clear()
+        p._last_sent.clear()
+        p.wake_from_row()
+        return db
+
+    def run_api(favourite):
+        db = FakeDB([favourite, None] if favourite else [None, None])
+        p._get_db = lambda: db
+        sent.clear()
+        p._last_sent.clear()
+        result = p._api_wake()
+        return db, result
+
+    hidden_fav = {"subnet_id": 2, "secureon": None}
+    visible_fav = {"subnet_id": 1, "secureon": None}
+    db = run_row(hidden_fav)
+    check(
+        len(sent) == 1 and stamps(db) == [],
+        f"wake_from_row: a favourite saved in B is NOT stamped by an A admin's wake of the host (sent={len(sent)}, stamps={stamps(db)})",
+    )
+    db = run_row(visible_fav)
+    check(
+        len(sent) == 1 and [s[2] for s in stamps(db)] == [("admin_A", mac1)],
+        f"wake_from_row: a favourite in the caller's own subnet IS stamped, with the caller's name (got {[s[2] for s in stamps(db)]})",
+    )
+    db = run_row(None)
+    check(len(sent) == 1 and stamps(db) == [], "wake_from_row: a host with no favourite writes nothing to wol_hosts")
+    db, result = run_api(hidden_fav)
+    check(
+        result == {"ok": True, "mac": mac1} and len(sent) == 1 and stamps(db) == [],
+        f"_api_wake: a scoped key's wake does not stamp a hidden favourite (got {result}, stamps={stamps(db)})",
+    )
+    db, result = run_api(visible_fav)
+    check(
+        len(sent) == 1 and [s[2] for s in stamps(db)] == [("api:k", mac1)],
+        f"_api_wake: ...but stamps one the key may see, as api:<key> (got {[s[2] for s in stamps(db)]})",
+    )
+    # the list's Wake button: a hidden favourite is not found at all, so nothing is sent or stamped
+    db = FakeDB([{"subnet_id": 2, "secureon": None, "label": "x", "mac": mac1}])
+    p._get_db = lambda: db
+    sent.clear()
+    p._last_sent.clear()
+    p.wake_favourite(5)
+    check(sent == [] and stamps(db) == [], "wake_favourite: a hidden favourite is not woken and not stamped")
+    db = FakeDB([{"subnet_id": 1, "secureon": None, "label": "x", "mac": mac1}])
+    p._get_db = lambda: db
+    sent.clear()
+    p._last_sent.clear()
+    p.wake_favourite(5)
+    check(len(sent) == 1 and len(stamps(db)) == 1, "wake_favourite: a visible favourite is woken and stamped")
+    # the impure core itself: nothing is written unless the caller says the favourite was visible
+    for flag, expect in ((None, 0), (False, 0), (True, 1)):
+        db = FakeDB()
+        p._get_db = lambda db=db: db
+        p._last_sent.clear()
+        if flag is None:
+            p._wake_mac(mac1, 1, None, "tester")
+        else:
+            p._wake_mac(mac1, 1, None, "tester", stamp=flag)
+        check(len(stamps(db)) == expect, f"_wake_mac: stamp={flag!r} writes {expect} stamp(s) (got {len(stamps(db))})")
+    p.current_user.username = "tester"
+    sys.modules["flask"].request = None
     p.request = None
 
     if failures:

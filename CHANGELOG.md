@@ -1,5 +1,29 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.5] - 2026-10-11
+
+Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: a wake no longer stamps a favourite the caller may not see
+
+Waking a host stamped `last_woken_at` and `last_woken_by` on the host's favourite, whoever owned it. The wake itself is judged on where the
+host is now, and a favourite is judged on the subnet it was stored in, so an admin of subnet A could wake a host in A whose favourite was
+stored in subnet B: the packet went out correctly, and the B favourite's row was then rewritten with the A admin's username. A row the caller
+could not see was changed, and its owner was shown who woke the host. `wake_inputs` now also returns whether a favourite exists and the caller
+may see it, and `_wake_mac` writes the stamp only on that answer (the default writes nothing). The wake, the SecureOn password rule and the
+audit and event are unchanged; the page, the row action and the JSON API all go through the same two functions.
+
+### Fixed: the refusal for a favourite that is not yours no longer talks about the MAC
+
+Saving a favourite over one the caller may not see (including losing the insert race to one) answered *That MAC is not on a subnet you can
+access*, a false sentence for a MAC the caller can see and a way to learn that a hidden favourite exists. It now says exactly *That favourite
+is not yours to change.* and nothing about the MAC. A MAC with no favourite that is in no subnet the caller can see keeps its own sentence, which
+is true there, and so does a wake of such a MAC.
+
+The harness runs the real routes against its fake database: a favourite saved in another subnet is not stamped by a wake from the page's row
+action or by a scoped API key, one in the caller's own subnet is (with the caller's name, or `api:<key>`), a host with no favourite writes
+nothing, and the refusal sentences are pinned.
+
 ## [1.1.4] - 2026-10-07
 
 Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
