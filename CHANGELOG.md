@@ -1,5 +1,25 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.1.7] - 2026-10-12
+
+Cleanup; no change to what a wake does or to any stored data. `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged: the helpers this release imports (`require_write`, `is_admin_or_above`) have been in `jen.plugin_api` since 5.65.10.
+
+### Changed: the admin check and the viewer gate are Jen's, not a copy
+
+Each plugin carried its own `_is_admin` and `_require_write`, with a fallback to reading `current_user.role` for a Jen that did not export the helper; copies of that shape had drifted between plugins. The four write routes (add, delete, wake from the list, and the Wake row action) now use `jen.plugin_api.require_write` with this plugin's sentence and the Wake page as the place to land, and the page asks `is_admin_or_above()` directly. For a form post nothing a person sees changes: the same sentence, the same redirect, decided before the route reads the request. A request that is JSON or under `/api/` would now get a 403 body instead of a flash that surfaces on the next page; none of this plugin's session routes is one (its one JSON route is key-authenticated and never flashes), so this is a guard, not a change.
+
+### Added: Investigate on every favourite row
+
+A favourite row names a host, so it carries Jen's Investigate action (the shared `investigate_link` macro), given the favourite's MAC.
+
+### Fixed: the Add Favourite form no longer promises the IP is shown on the row
+
+The IP field said it was "shown on the row". It never is: the address is stored with the favourite and nothing reads it back (a wake goes by the MAC and the subnet's broadcast address). The hint now says it is kept with the favourite, and the README says the column is recorded and not displayed. The column is not dropped.
+
+### Documented, not changed
+
+`_derive_subnet_id` stays: it takes the subnet map as an argument so the harness can run it on a fixed map, where `plugin_api.subnet_for_ip` reads Jen's live one. `in_scope`, `_when` and `subnet_label` stay: they are pure functions of this plugin's own cards, and `plugin_api` has no equivalent. `_normalize_mac` stays as a thin wrapper because this plugin treats a bad MAC as "none given" (`""`), where `plugin_api.normalize_mac` answers `None`.
+
 ## [1.1.6] - 2026-10-11
 
 Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.

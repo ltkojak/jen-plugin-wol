@@ -11,8 +11,10 @@ register() can be silently broken in a way nothing else catches).
 Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 """
 
+import functools
 import importlib.util
 import os
+import pathlib
 import sys
 import types
 
@@ -51,6 +53,50 @@ def _stub_modules():
 class _FakeApp:
     def register_blueprint(self, bp):
         pass
+
+
+# The role gate the real jen.plugin_api provides (`is_admin_or_above`, `is_superadmin`, `require_write`), reading the
+# stub current_user's role LIVE so a check can flip it. plugin.py imports them at the top, so they must exist before it
+# is loaded. A refusal is recorded (message, endpoint) and the route is not run, which is what the real decorator does
+# for a page request: flash, redirect, never touch the request.
+GATE_REFUSALS = []
+
+
+def _gate_is_admin_or_above():
+    return getattr(sys.modules["flask_login"].current_user, "role", None) in ("superadmin", "admin")
+
+
+def _gate_is_superadmin():
+    return getattr(sys.modules["flask_login"].current_user, "role", None) == "superadmin"
+
+
+def _gate_require_write(message="Viewers can look at this but not change it.", redirect_endpoint="dashboard.dashboard"):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapped(*a, **k):
+            if _gate_is_admin_or_above():
+                return fn(*a, **k)
+            GATE_REFUSALS.append((message, redirect_endpoint))
+            return "refused"
+
+        return wrapped
+
+    return deco
+
+
+def _install_gate_api(plugin_api=None):
+    """Put the gate functions on the stub jen.plugin_api (creating the stub package when none exists yet)."""
+    if plugin_api is None:
+        plugin_api = sys.modules.get("jen.plugin_api")
+        if plugin_api is None:
+            jen_pkg = types.ModuleType("jen")
+            plugin_api = types.ModuleType("jen.plugin_api")
+            jen_pkg.plugin_api = plugin_api
+            sys.modules["jen"] = jen_pkg
+            sys.modules["jen.plugin_api"] = plugin_api
+    plugin_api.is_admin_or_above = _gate_is_admin_or_above
+    plugin_api.is_superadmin = _gate_is_superadmin
+    plugin_api.require_write = _gate_require_write
 
 
 def _stub_normalize_mac(raw):
@@ -92,6 +138,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.api_key_required = api_key_required
     plugin_api.normalize_mac = _stub_normalize_mac
+    _install_gate_api(plugin_api)
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -100,6 +147,7 @@ def _stub_jen_plugin_api():
 
 def load_plugin():
     _stub_modules()
+    _install_gate_api()
     spec = importlib.util.spec_from_file_location("wol_plugin", os.path.join(ROOT, "plugin.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -177,22 +225,38 @@ def main():
 
     # ── write gate — viewers can look at Wake & Actions but not send a wake ──
     p.current_user.role = "viewer"
-    check(p._is_admin() is False, "a viewer is not admin")
-    check(p._require_write() is False, "a viewer cannot write")
+    check(p.is_admin_or_above() is False, "a viewer is not admin")
     for fn, args in (
         (p.add_favourite, ()),
         (p.delete_favourite, (1,)),
         (p.wake_favourite, (1,)),
         (p.wake_from_row, ()),
     ):
+        del GATE_REFUSALS[:]
         try:
-            fn(*args)
-            gated = True
+            got = fn(*args)
+            gated = got == "refused"
         except Exception:
             gated = False
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
+        check(
+            GATE_REFUSALS == [("Viewers can look at Wake & Actions but not send a wake packet.", "wol.index")],
+            f"{fn.__name__}: the viewer is told the plugin's own sentence and sent to the Wake page (got {GATE_REFUSALS})",
+        )
     p.current_user.role = "admin"
-    check(p._is_admin() is True, "admin role restored for the rest of the run")
+    check(p.is_admin_or_above() is True, "admin role restored for the rest of the run")
+    check(
+        all(
+            fn.__name__ == fn.__wrapped__.__name__
+            for fn in (p.add_favourite, p.delete_favourite, p.wake_favourite, p.wake_from_row)
+        ),
+        "the four write routes carry the plugin_api require_write decorator (functools.wraps)",
+    )
+    src = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    check(
+        "def _is_admin" not in src and "def _require_write" not in src,
+        "plugin.py no longer carries its own copies of the admin check or the write gate",
+    )
 
     # ── 1.0.1: the rate-limit map stays bounded ──────────────────────────────
     stale = {"aa:aa:aa:aa:aa:01": 10.0, "aa:aa:aa:aa:aa:02": 95.0, "aa:aa:aa:aa:aa:03": 100.0}
@@ -255,7 +319,6 @@ def main():
     p.redirect = lambda where: "redirect"
     p.url_for = lambda *a, **k: "/x"
     p.jsonify = lambda payload: payload
-    p._require_write = lambda: True
     p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
     p._send_wake = lambda mac, cidr, secureon: sent.append((mac, cidr, secureon))
     mac_subnet = {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}  # a MAC Jen has never seen is absent
@@ -564,6 +627,7 @@ def main():
 
     _spec = _ilu.spec_from_file_location("wol_plugin_raw", os.path.join(ROOT, "plugin.py"))
     _raw = _ilu.module_from_spec(_spec)
+    _install_gate_api()  # plugin.py imports the gate at its top
     _spec.loader.exec_module(_raw)
     p._send_wake = types.FunctionType(_raw._send_wake.__code__, p.__dict__)  # the real one; the harness had stubbed it
     try:
@@ -931,7 +995,6 @@ def main():
     sys.modules["jen.plugin_api"].encrypt_secret = lambda s: (
         "v1:" + s[::-1]
     )  # the route parses SecureOn before it looks anything up
-    p._require_write = lambda: True
     p._can = only_one
     p._current_subnet_for_mac = lambda mac: 1
     flaky = _FlakyFirst([{"subnet_id": 2}])
@@ -1139,7 +1202,6 @@ def main():
 
     p._can = only_one
     p._current_subnet_for_mac = lambda mac: 1  # the host is in the caller's subnet
-    p._require_write = lambda: True
     p.current_user.username = "admin_A"
     p._send_wake = lambda mac, cidr, secureon: sent.append((mac, cidr, secureon))  # an earlier check left a failing one
     jen_api_now = types.ModuleType("jen.plugin_api")
@@ -1219,6 +1281,13 @@ def main():
     p.current_user.username = "tester"
     sys.modules["flask"].request = None
     p.request = None
+
+    # ── 1.1.7: every favourite row carries the Investigate action (Jen's macro) ────────────────────────────────────
+    page = pathlib.Path(ROOT, "templates", "wol", "index.html").read_text(encoding="utf-8")
+    check(
+        "{% from '_investigate.html' import investigate_link %}" in page and 'investigate_link(r.mac, "icon")' in page,
+        "index.html: each favourite row carries Jen's Investigate macro, given its MAC",
+    )
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

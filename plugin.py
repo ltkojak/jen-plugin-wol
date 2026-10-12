@@ -39,6 +39,8 @@ import time
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
+from jen.plugin_api import is_admin_or_above, require_write
+
 logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "wol"
@@ -53,6 +55,8 @@ bp = Blueprint(
 
 _WOL_PORT = 9
 _RATE_LIMIT_WINDOW_S = 5
+
+_VIEWER_MESSAGE = "Viewers can look at Wake & Actions but not send a wake packet."
 
 
 # ── Pure: MAC/SecureOn parsing, the magic packet builder, broadcast maths ──────
@@ -166,25 +170,6 @@ def _can(subnet_id):
     from jen.plugin_api import can_access_subnet
 
     return can_access_subnet(subnet_id)
-
-
-def _is_admin():
-    try:
-        from jen.plugin_api import is_admin_or_above
-
-        return is_admin_or_above()
-    except Exception:
-        role = getattr(current_user, "role", None)
-        if role is not None:
-            return role in ("superadmin", "admin")
-        return bool(getattr(current_user, "is_admin", False))
-
-
-def _require_write():
-    if _is_admin():
-        return True
-    flash("Viewers can look at Wake & Actions but not send a wake packet.", "error")
-    return False
 
 
 def _audit(action, target, detail):
@@ -637,6 +622,7 @@ def index():
     # the caller may see, and never widens what they are shown.
     rows = [r for r in _favourite_rows() if _can(r["subnet_id"])]
     subnet_map = _subnet_map()
+    admin = is_admin_or_above()
     for r in rows:
         sid = r["subnet_id"]
         r["effective_subnet_id"] = sid
@@ -646,17 +632,15 @@ def index():
     return render_template(
         "wol/index.html",
         rows=rows,
-        candidates=_candidate_hosts() if _is_admin() else [],
-        is_admin=_is_admin(),
+        candidates=_candidate_hosts() if admin else [],
+        is_admin=admin,
     )
 
 
 @bp.route("/favourites/add", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "wol.index")
 def add_favourite():
-    if not _require_write():
-        return redirect(url_for("wol.index"))
-
     mac = _normalize_mac(request.form.get("mac", ""))
     if not mac:
         flash("Invalid MAC address.", "error")
@@ -716,9 +700,8 @@ def add_favourite():
 
 @bp.route("/favourites/<int:host_id>/delete", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "wol.index")
 def delete_favourite(host_id):
-    if not _require_write():
-        return redirect(url_for("wol.index"))
     db = None
     try:
         db = _get_db()
@@ -751,9 +734,8 @@ def delete_favourite(host_id):
 
 @bp.route("/favourites/<int:host_id>/wake", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "wol.index")
 def wake_favourite(host_id):
-    if not _require_write():
-        return redirect(url_for("wol.index"))
     db = None
     try:
         db = _get_db()
@@ -785,12 +767,11 @@ def wake_favourite(host_id):
 
 @bp.route("/wake", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "wol.index")
 def wake_from_row():
-    # v1.0.0: redirects to wol.index always, never request.referrer — a
-    # gated viewer's denial path must never touch `request` at all (the
-    # same lesson jen-plugin-watchdog's watch_from_row() learned first).
-    if not _require_write():
-        return redirect(url_for("wol.index"))
+    # A gated viewer's denial path never touches `request` (the lesson jen-plugin-watchdog's
+    # watch_from_row() learned first, and why this redirects to wol.index and never to
+    # request.referrer): the gate is jen.plugin_api's require_write, which decides before this runs.
     mac = _normalize_mac(request.args.get("mac", ""))
     if not mac:
         flash("Invalid MAC address.", "error")
@@ -808,9 +789,8 @@ def wake_from_row():
 
 
 # ── JSON API (v1.0.0) ────────────────────────────────────────────────────────
-# Undecorated on purpose: api_key_required() is applied in register(app), not
-# here, so plugin.py's top level never imports jen.plugin_api — the standalone
-# harness (tools/test_plugin.py) stubs only flask/flask_login.
+# Undecorated on purpose: api_key_required() is applied in register(app), where each
+# route is added to the blueprint.
 
 api_bp = Blueprint("wol_api", __name__, url_prefix="/api/v1/plugins/wol")
 

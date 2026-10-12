@@ -15,12 +15,17 @@ A standard 102-byte Wake-on-LAN magic packet (six `0xFF` bytes, then the target 
 ## Features
 
 - **Wake** row action on Lease, Reservation, and Device rows — sends a packet with one click and a confirmation naming the actual MAC
-- **Favourites** page (nav Management → Wake): save a MAC (with an optional label, an IP to show on the row, and a SecureOn password that a blank re-add keeps; the password is stored encrypted and never shown again), wake it with one click, see when it was last woken and by whom
+- **Favourites** page (nav Management → Wake): save a MAC (with an optional label, an IP to keep with it, and a SecureOn password that a blank re-add keeps; the password is stored encrypted and never shown again), wake it with one click, see when it was last woken and by whom
 - **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" for a favourite — its label, whether a SecureOn password is set, and when it was last woken and by whom. A favourite is judged by the subnet it was saved in on every surface (the list, add, delete, the wake from the list), so it is not shown or editable by an account that cannot see that subnet just because the host has since moved into one it can; a wake itself is judged on where the host is now, and never uses the SecureOn password of a favourite the account may not see; where the host is now is shown only when the account may see that subnet too
+- **Investigate** on every favourite row, Jen's own action for a row that names a client
 - **Rate-limited**: at most one wake packet per MAC every 5 seconds, whichever entry point sent it
 - Every wake is audited (`WOL_SENT`) and emits a `plugin.wol.sent` event
 - **JSON API**: `POST /api/v1/plugins/wol/wake` `{"mac": "..."}` (write key), scoped to the calling key's accessible subnets
 - Respects Jen's subnet access control on both the favourites list and the "Add Favourite" picker — a favourite on a subnet you can't see is neither shown nor wakeable. The subnet of a wake or a new favourite is worked out from the MAC (its active lease, then its reservation) — never from a value in the request — and a MAC Jen has never seen has no subnet, so it is for accounts that can see every subnet (API keys too). Adding, removing, and waking a favourite, and using the row action, all need admin — viewers are read-only
+
+## Recorded for the audit trail, not displayed
+
+`wol_hosts.ip` is the optional address typed into the Add Favourite form. It is stored with the favourite (only when it is an address in the subnet the MAC is in) and nothing in this plugin reads it back: a wake is aimed by the MAC and the subnet's broadcast address, and no page or API response shows the IP. The column is kept as the record of what was entered and is not dropped. (`last_woken_at` and `last_woken_by`, which look similar, are shown on the favourites list.)
 
 ## Installation
 
