@@ -1,5 +1,51 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.2.0] - 2026-11-21
+
+A wake now says when it left Jen's own network, the audit row of a wake names who asked and how, a wake is refused when the saved settings cannot be read, and the plugin is spelled the American way throughout. Four rows of the 7.2.0 plugin audit (WOL-1 to WOL-4) and the spelling pass Jen's own suite was waiting for (WOL-16), with the README sentence of WOL-22. `requires_jen` stays 5.68.0 (`subnet_context` has been in `jen.plugin_api` since 5.30.0) and `plugin_api` stays 3. No migration; no stored data changes. This is a MINOR release because three route paths and two audit codes are renamed and the API answer gains two fields.
+
+### Fixed: "Wake packet sent" when the packet could not arrive (WOL-1, WOL-2)
+
+A wake is sent to the target subnet's directed broadcast address and to `255.255.255.255`. When Jen's host has an address in that subnet, either one reaches the host. When it does not (a routed VLAN whose clients reach Kea through a relay, or any subnet at all when Jen runs in a container on Docker's default bridge network), the limited broadcast stays on the network Jen is on and the directed broadcast is handed to a router, which drops it unless it was configured to forward directed broadcasts. The send itself succeeds in every one of these cases, so the page said *Wake packet sent to X.*, the API answered `{"ok": true}`, and nothing woke. The limitation was written in the README and nowhere a person looks at the moment of the wake.
+
+The send is unchanged: the same two addresses as before. What changed is the answer. Once per wake, after the packet has gone, the plugin asks Jen's `subnet_context` whether Jen has an address in the subnet of the wake, and keeps three answers apart:
+
+- Jen has an address there: the sentence used before, unchanged.
+- Jen answered and has none: a warning, *Wake packet sent toward 10.0.2.255 for aa:bb:cc:dd:ee:ff. Jen has no address in that subnet, so it arrives only if a router forwards directed broadcasts.*
+- Jen could not be asked (the context raised, or answered nothing for that subnet): the sentence used before. Not knowing is not a reason to alarm, and the exception goes to Jen's log, never to the page.
+
+A MAC Jen has no subnet for (only an account that sees every subnet may wake one) is its own case, since only the limited broadcast is targeted: *Wake packet sent on Jen's own network only: Jen does not know which subnet aa:bb:cc:dd:ee:ff is on.*, also a warning.
+
+The API answer on success keeps `ok` and `mac` and gains `on_link` (`true`, `false` or `null`) and `targets`, the addresses the packet was sent to, sorted as text. The README has a new section, "When the host is on another subnet or Jen runs in Docker", which says what a router has to do and that under Docker the container needs host networking or a macvlan network.
+
+### Fixed: the audit row of a wake through the API named nobody (WOL-3)
+
+`WOL_SENT` recorded `subnet_id=N` and nothing else. For a wake from a page the audit row at least carried the signed-in user. A request with an API key has no session user, so its row read `system` and the key's name was nowhere in it. The detail is now `via=<favorite|row|page|api> subnet_id=<N or none> on_link=<yes|no|unknown>`: which entry point the wake came through, the subnet it was sent on, and the on-link answer above. A wake through the API starts with `[api-key:<name>]`, exactly the prefix Jen's own API writes use, so one search of the Audit page finds everything a key did. The Wake button of the favorites list is recorded as `via=favorite` and the Wake row action as `via=row`; `page` is the value for a wake that names no entry point of its own, and no route of this release sends one.
+
+### Fixed: a wake went out without the SecureOn password when the favorite could not be read (WOL-4)
+
+Before sending, a wake looks up the MAC's favorite, because the favorite may hold a SecureOn password. If that lookup failed (the database did not answer), the wake went on as if there were no favorite. For a NIC that requires SecureOn the packet was then built without the password, the NIC ignored it, and the person was told *Wake packet sent*; the wake was audited as sent and the 5-second limit was started. "The lookup failed" was read as "there is no favorite", which are different answers.
+
+A lookup that fails now refuses the wake, for every caller whatever they may see: nothing is sent, nothing is audited as sent, the rate limit is not started, and the exception is logged. The page and the row action say *Could not read the saved wake settings - nothing was sent. Try again in a moment.* The API answers 503 with `{"ok": false, "error": "The saved wake settings could not be read"}`. The Wake button of the favorites list reads its favorite by id and used to answer a failed read with an error page; it now gives the same sentence. A lookup that answered "no favorite" is unchanged: the wake goes without a password, as it should.
+
+### Changed: American spelling everywhere, including three route paths and two audit codes (WOL-16)
+
+Jen's own pages and manual say "favorite"; this plugin said "favourite" in its page heading, buttons, every flash, the Investigation card, its description under Settings, Plugins, and its README. All of it is now "favorite", and so are the names behind it:
+
+- The form actions `/management/wol/favourites/add`, `/management/wol/favourites/<id>/delete` and `/management/wol/favourites/<id>/wake` are now `/management/wol/favorites/...`. They are renamed outright, with no alias: they are POST form actions the page itself fills in, and nothing bookmarks them.
+- **The audit codes `WOL_ADD_FAVOURITE` and `WOL_DELETE_FAVOURITE` are now `WOL_ADD_FAVORITE` and `WOL_DELETE_FAVORITE`.** Rows written before the upgrade keep the old code on the Audit page; a filter for the history of the favorites list has to name both.
+- Function, endpoint and template names follow (`add_favorite`, `delete_favorite`, `wake_favorite`, and so on), and comments say `normalization`, `authorized` and `judgment`.
+
+Database table and column names are not changed, and the entries below this one are a record and keep the spelling they were written in.
+
+### Documentation (WOL-22)
+
+The README said the subnet of a wake is found from the MAC's "active lease, then its reservation". The plugin has used Jen's own precedence since 1.0.2, which adds the device's last known subnet, the case that matters most for a host that is asleep. The sentence now says so. The module docstring no longer calls the SecureOn password "not a real secret"; it has been stored encrypted since 1.0.2.
+
+### Harness
+
+The fake socket now records where each packet was sent, and a check runs the real `_send_wake` and names the two addresses; before, a change that dropped the directed broadcast would have passed. New checks run the real routes for each on-link answer (the sentence, its category, the API fields), for `subnet_context` raising, for the `WOL_SENT` detail of each entry point with a key named `backup-box`, and for a favorite lookup that raises (no send, no audit row, the refusal, 503, and the next wake not rate limited). The stub Blueprint records every route it is given, so the renamed paths are checked as registered and the old ones as gone.
+
 ## [1.1.7] - 2026-10-12
 
 Cleanup; no change to what a wake does or to any stored data. `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged: the helpers this release imports (`require_write`, `is_admin_or_above`) have been in `jen.plugin_api` since 5.65.10.

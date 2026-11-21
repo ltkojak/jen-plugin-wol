@@ -14,10 +14,10 @@
 <div class="page-header flex items-center between wrap gap-3">
     <div>
         <h1>{{ icon("zap", "ico-lg") }} Wake</h1>
-        <p>Wake-on-LAN favourites — send a magic packet to any host below, or use the "Wake" action on a Lease, Reservation, or Device row.</p>
+        <p>Wake-on-LAN favorites — send a magic packet to any host below, or use the "Wake" action on a Lease, Reservation, or Device row.</p>
     </div>
     {% if is_admin %}
-    <button id="wol-add-btn" class="btn btn-primary">{{ icon("plus") }} Add Favourite</button>
+    <button id="wol-add-btn" class="btn btn-primary">{{ icon("plus") }} Add Favorite</button>
     {% endif %}
 </div>
 
@@ -29,7 +29,7 @@
 <div class="table-wrap">
 <table class="rowlist">
     <thead><tr>
-        <th>Favourite</th>
+        <th>Favorite</th>
         <th>Subnet</th>
         <th>SecureOn</th>
         <th>Last woken</th>
@@ -51,13 +51,13 @@
             <div class="flex gap-1 items-center">
                 {{ investigate_link(r.mac, "icon") }}
                 {% if is_admin %}
-                <form method="POST" action="{{ url_for('wol.wake_favourite', host_id=r.id) }}" class="contents"
+                <form method="POST" action="{{ url_for('wol.wake_favorite', host_id=r.id) }}" class="contents"
                       data-confirm="Send a wake packet to {{ r.label or r.mac }}?">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn btn-sm btn-primary" title="Wake" aria-label="Wake">{{ icon("zap") }}</button>
                 </form>
-                <form method="POST" action="{{ url_for('wol.delete_favourite', host_id=r.id) }}" class="contents"
-                      data-confirm="Remove {{ r.label or r.mac }} from favourites?">
+                <form method="POST" action="{{ url_for('wol.delete_favorite', host_id=r.id) }}" class="contents"
+                      data-confirm="Remove {{ r.label or r.mac }} from favorites?">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn btn-sm btn-secondary bad" title="Delete" aria-label="Delete">{{ icon("trash") }}</button>
                 </form>
@@ -67,7 +67,7 @@
     </tr>
     {% endfor %}
     {% if not rows %}
-    <tr><td data-m="full" colspan="5" class="center muted">No favourites yet. {% if is_admin %}Add one above, or use the "Wake" action on any Lease, Reservation, or Device row.{% endif %}</td></tr>
+    <tr><td data-m="full" colspan="5" class="center muted">No favorites yet. {% if is_admin %}Add one above, or use the "Wake" action on any Lease, Reservation, or Device row.{% endif %}</td></tr>
     {% endif %}
     </tbody>
 </table>
@@ -78,10 +78,10 @@
 <div id="wol-add-modal" class="wol-modal">
 <div class="card wol-dialog">
     <div class="flex between items-center mb-3">
-        <h3>{{ icon("plus") }} Add Favourite</h3>
+        <h3>{{ icon("plus") }} Add Favorite</h3>
         <button id="wol-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
     </div>
-    <form method="POST" action="{{ url_for('wol.add_favourite') }}" id="wol-add-form">
+    <form method="POST" action="{{ url_for('wol.add_favorite') }}" id="wol-add-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-group">
             <label>MAC address</label>
@@ -97,7 +97,7 @@
             <input type="text" name="label" id="wol-label" maxlength="100" autocomplete="off">
         </div>
         <div class="form-group">
-            <label>IP <span class="small muted">(optional — kept with the favourite; the subnet comes from the MAC)</span></label>
+            <label>IP <span class="small muted">(optional — kept with the favorite; the subnet comes from the MAC)</span></label>
             <input type="text" name="ip" id="wol-ip" class="mono" autocomplete="off">
         </div>
         <div class="form-group">
@@ -105,7 +105,7 @@
             <input type="text" name="secureon" class="mono" placeholder="aa:bb:cc:dd" autocomplete="off">
         </div>
         <div class="flex gap-2 mt-3">
-            <button type="submit" class="btn btn-primary">Add Favourite</button>
+            <button type="submit" class="btn btn-primary">Add Favorite</button>
             <button type="button" id="wol-add-cancel-btn" class="btn btn-secondary">Cancel</button>
         </div>
     </form>
