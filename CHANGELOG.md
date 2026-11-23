@@ -1,5 +1,41 @@
 # Wake & Actions Plugin — Changelog
 
+## [1.2.1] - 2026-11-22
+
+Two answers of a wake are corrected, the hosts saved on the page are called saved hosts, and an empty page shows its first steps. From the executing pass on Jen 7.2.0-beta.5 (BH4, BH5, BH8) and the look over its pages (V31, V52 and addition 11 of that review). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration; routes, endpoint names, audit actions and the API's fields are unchanged.
+
+### Fixed: on a host with no `ip` command every wake was told Jen has no address in the subnet (BH4)
+
+Since 1.2.0 a wake asks Jen whether Jen's own host has an address in the subnet of the wake. Jen reads the host's addresses with the `ip` command and, when that cannot run, falls back to what the hostname resolves to. On Ubuntu that is `127.0.1.1`, which is in no subnet, so the answer came back "Jen has no address there" when the truth was "Jen could not tell". Jen's container image up to 7.2.0-beta.5 installs no `ip` command, so under host networking, the setup the README recommends for Wake, every wake got the warning *Jen has no address in that subnet, so it arrives only if a router forwards directed broadcasts* and its audit row said `on_link=no`, while the packet was on the LAN.
+
+The plugin now looks for the `ip` command itself, in the same four places Jen does (`/usr/sbin/ip`, `/sbin/ip`, `/bin/ip`, and `ip` on the PATH), before it asks. When there is none the answer is "could not be asked": the plain sentence *Wake packet sent to ...*, `on_link` is `null` in the API answer and the audit row says `on_link=unknown`. With an `ip` command the three answers of 1.2.0 are as they were. The send itself was never affected.
+
+One consequence to know: in an image with no `ip` command the plain sentence is now also what a wake gets on Docker's default bridge network, where 1.2.0's warning happened to be true (the packet does not reach the LAN from there). "Could not tell" is the honest answer in both cases; the warning needs an image or a host that has the `ip` command. The README's Docker section says what the container needs for a wake to arrive.
+
+### Fixed: a wake on a subnet Jen is not configured for was answered as a success (BH5)
+
+A wake goes to the directed broadcast of the MAC's subnet and to `255.255.255.255`. When the MAC is on a Kea subnet that is not in Jen's subnet list, Jen has no broadcast address for it and only `255.255.255.255` is targeted, which stays on the network Jen's host is on. 1.2.0 warned about that only when the MAC had no subnet at all; with a subnet id Jen does not know it answered *Wake packet sent to host.* as a success. It is now a warning: *Wake packet sent on Jen's own network only: subnet 7 is not one Jen is configured for.* Only an account that sees every subnet can reach this. The API answer already listed the one address in `targets` and is unchanged.
+
+### Changed: the hosts saved on the page are "saved hosts" (V31)
+
+Jen's own navigation has Favorites now (pinned pages), so one word meant two things. On the Wake page, in its messages and on the Investigation card the hosts you saved are *saved hosts*: the button is "Save Host", the column "Saved host", the messages "... added to saved hosts.", "Saved host removed.", "Saved host not found.", "That saved host is not yours to change.", "That saved host changed while you were saving it ...", "Could not save the host; the details are in Jen's log." and "Could not remove the saved host; the details are in Jen's log.", and the card's summary "A saved host (label)". The plugin's description under Settings, Plugins and the README follow. The column "SecureOn" is headed "SecureOn password".
+
+Only the words a person reads changed. The routes (`/management/wol/favorites/...`), the endpoint and function names, the table `wol_hosts`, the audit actions `WOL_ADD_FAVORITE` and `WOL_DELETE_FAVORITE`, the audit detail `via=favorite` and the text of the audit rows are as they were, so a search of the Audit page finds the same rows as before.
+
+### The audit names across the upgrade to 1.2.0 (BH8)
+
+Audit rows written before 1.2.0 keep the action names they were written with (`WOL_ADD_FAVOURITE`, `WOL_DELETE_FAVOURITE`), so a search of the Audit page for `WOL_` finds both spellings and a search for `FAVORITE` finds only the rows written since 1.2.0.
+
+### The page: first steps in place of an empty table, and the button stays in the header (V52, addition 11)
+
+With no saved host the page showed an empty table with one line of text, which on a phone sat high in its row. It now shows a "Getting started" card in its place, with two steps: save a host (with the Save Host button in the step, or for a viewer the note that saving needs an admin, and the reminder that the Wake action on a Lease, Reservation or Device row needs no saved host), and what happens then: nothing is sent until someone presses Wake, and Jen then sends the packet to the broadcast address of the host's subnet and to its own network, writes the wake to the audit log and shows when the host was last woken and by whom. Wake registers no alert type, so there is no third step.
+
+At tablet width the header's long sentence pushed the button under it. The sentence is shorter and now wraps before the button moves, so Save Host stays at the right of the header down to phone width.
+
+### The harness
+
+`tools/test_plugin.py` runs the real `_ip_command_present` with the three paths and the PATH lookup stood in, and the real wake routes with it answering False: the plain sentence, `on_link=unknown`, and the context is not asked (1.2.0: the warning and `on_link=no`). It checks the new answer of `sent_message` for a subnet id with no broadcast, through the pure function and through the row action and the API, and that the three answers of 1.2.0 are unchanged. It reads the template, every flash sentence, the refusals, the Investigation card, the manifest and the README for the word favorite, which is left only in the endpoint names and inside code, and checks the page's first steps, headings and buttons. The on-link checks of 1.2.0 now stand `_ip_command_present` in as True, so they do not depend on the box they run on.
+
 ## [1.2.0] - 2026-11-21
 
 A wake now says when it left Jen's own network, the audit row of a wake names who asked and how, a wake is refused when the saved settings cannot be read, and the plugin is spelled the American way throughout. Four rows of the 7.2.0 plugin audit (WOL-1 to WOL-4) and the spelling pass Jen's own suite was waiting for (WOL-16), with the README sentence of WOL-22. `requires_jen` stays 5.68.0 (`subnet_context` has been in `jen.plugin_api` since 5.30.0) and `plugin_api` stays 3. No migration; no stored data changes. This is a MINOR release because three route paths and two audit codes are renamed and the API answer gains two fields.

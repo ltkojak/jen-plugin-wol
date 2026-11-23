@@ -36,6 +36,7 @@ import ipaddress
 import logging
 import os as _os
 import re
+import shutil
 import socket
 import time
 
@@ -146,10 +147,18 @@ def sent_message(name, mac, subnet_id, broadcast, on_link):
     - no subnet known for the MAC: only the limited broadcast was targeted, which stays on Jen's own network;
     - Jen has no address in the target subnet (`on_link` False): the directed broadcast goes through a router, and
       most routers drop it;
-    - Jen has an address there, or Jen could not be asked (`on_link` None): the sentence used before 1.2.0."""
+    - Jen has an address there, or Jen could not be asked (`on_link` None): the sentence used before 1.2.0.
+    v1.2.1 (BH5) - a fourth answer, between the first two: a subnet id is known but there is no `broadcast`, because the
+    subnet is not in Jen's subnet map (a Kea subnet Jen is not configured for). Only the limited broadcast was targeted,
+    exactly as with no subnet at all, and 1.2.0 answered "Wake packet sent to <name>." as a success."""
     if subnet_id is None:
         return f"Wake packet sent on Jen's own network only: Jen does not know which subnet {mac} is on.", "warning"
-    if on_link is False and broadcast:
+    if not broadcast:
+        return (
+            f"Wake packet sent on Jen's own network only: subnet {subnet_id} is not one Jen is configured for.",
+            "warning",
+        )
+    if on_link is False:
         return (
             f"Wake packet sent toward {broadcast} for {mac}. Jen has no address in that subnet, so it arrives only "
             "if a router forwards directed broadcasts.",
@@ -256,12 +265,33 @@ WAKE_SETTINGS_REFUSAL = "Could not read the saved wake settings - nothing was se
 WAKE_SETTINGS_API_ERROR = "The saved wake settings could not be read"
 
 
+_IP_COMMAND_PATHS = ("/usr/sbin/ip", "/sbin/ip", "/bin/ip")
+
+
+def _ip_command_present():
+    """v1.2.1 (BH4) - is there an `ip` command on this host? Jen's `subnet_context` reads the host's addresses with `ip -4 -o addr`
+    and, when that cannot run, falls back to what the hostname resolves to. That fallback is not evidence of which addresses the
+    host has: on Ubuntu the hostname resolves to 127.0.1.1, and Jen's container image up to 7.2.0-beta.5 installs no `ip`, so
+    under host networking every wake was told Jen has no address in the subnet. The four candidates are the ones
+    `jen_host_ips` tries."""
+    return any(_os.path.exists(path) for path in _IP_COMMAND_PATHS) or shutil.which("ip") is not None
+
+
 def _jen_on_link(subnet_id):
     """Does Jen have an address in `subnet_id`? Three answers, kept apart (v1.2.0, WOL-1): True (it has one), False (Jen's
     `subnet_context` answered and lists none), None (there is no subnet to ask about, or the context could not be asked:
     it raised, answered None for a subnet Jen no longer has, or carries no `jen_host_ips`). The exception is logged and
-    never shown. This only words the answer; it never decides whether or where the packet is sent."""
+    never shown. This only words the answer; it never decides whether or where the packet is sent.
+
+    v1.2.1 (BH4) - also None, before the context is asked at all, when the host has no `ip` command (`_ip_command_present`):
+    what the context would then list comes from the hostname, and "the hostname does not resolve into this subnet" is not
+    "Jen has no address in this subnet"."""
     if subnet_id is None:
+        return None
+    if not _ip_command_present():
+        logger.info(
+            "Wake & Actions: this host has no `ip` command, so whether Jen has an address in the subnet is not known"
+        )
         return None
     try:
         from jen.plugin_api import subnet_context
@@ -493,10 +523,10 @@ def investigation_card(favorite, now_in_label=""):
     label = favorite.get("label") or ""
     woken = favorite.get("last_woken_at")
     by = favorite.get("last_woken_by") or ""
-    summary = f"A favorite ({label})" if label else "A favorite"
+    summary = f"A saved host ({label})" if label else "A saved host"
     summary += f"; last woken {_when(woken)}" + (f" by {by}" if by else "") if woken else "; never woken from Jen"
     rows = [
-        {"label": "Favorite", "value": label or "saved without a label"},
+        {"label": "Saved host", "value": label or "saved without a label"},
         {"label": "SecureOn password", "value": "set" if favorite.get("secureon") else "not set"},
         {"label": "Last woken", "value": _when(woken) if woken else "never"},
     ]
@@ -605,9 +635,9 @@ LOOKUP_REFUSAL = "Could not check the existing record — nothing was changed."
 # v1.1.5 - an existing favorite the caller may not see says only that it is not theirs to change: 1.1.4 answered "That MAC is not
 # on a subnet you can access" for a MAC the caller CAN see that merely has a hidden favorite - a false sentence, and a way to learn
 # that a favorite exists. A MAC with no favorite and no visible subnet keeps its own, true, sentence.
-NOT_YOURS = "That favorite is not yours to change."
+NOT_YOURS = "That saved host is not yours to change."
 MAC_NOT_YOURS = "That MAC is not on a subnet you can access."
-CHANGED_UNDERFOOT = "That favorite changed while you were saving it — nothing was changed. Try again."
+CHANGED_UNDERFOOT = "That saved host changed while you were saving it — nothing was changed. Try again."
 
 
 def _save_favorite(db, mac, ip, label, secureon, on_write=None):
@@ -759,14 +789,14 @@ def add_favorite():
             flash(refusal, "error")
             return redirect(url_for("wol.index"))
         db.commit()
-        flash(f"{label or mac} added to favorites.", "success")
+        flash(f"{label or mac} added to saved hosts.", "success")
         _audit("WOL_ADD_FAVORITE", mac, f"label={label}")
     except _LookupFailed as e:
         logger.error(f"Wake & Actions: could not check for an existing favorite: {e}")
         flash(LOOKUP_REFUSAL, "error")
     except Exception as e:
         logger.error(f"Wake & Actions: could not add favorite ({stage}): {e}")
-        flash("Could not add the favorite; the details are in Jen's log.", "error")
+        flash("Could not save the host; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -785,10 +815,10 @@ def delete_favorite(host_id):
             cur.execute("SELECT mac, subnet_id FROM wol_hosts WHERE id=%s FOR UPDATE", (host_id,))
             row = cur.fetchone()
             if row is None:
-                flash("Favorite not found.", "error")
+                flash("Saved host not found.", "error")
                 return redirect(url_for("wol.index"))
             if not _can(row["subnet_id"]):  # a stored object: its own subnet, never where the MAC is now
-                flash("Favorite not found.", "error")
+                flash("Saved host not found.", "error")
                 return redirect(url_for("wol.index"))
             cur.execute("DELETE FROM wol_hosts WHERE id=%s AND subnet_id <=> %s", (host_id, row["subnet_id"]))
             if cur.rowcount != 1:
@@ -796,11 +826,11 @@ def delete_favorite(host_id):
                 flash(CHANGED_UNDERFOOT, "error")
                 return redirect(url_for("wol.index"))
         db.commit()
-        flash("Favorite removed.", "success")
+        flash("Saved host removed.", "success")
         _audit("WOL_DELETE_FAVORITE", str(host_id), "favorite removed")
     except Exception as e:
         logger.error(f"Wake & Actions: could not remove favorite: {e}")
-        flash("Could not remove the favorite; the details are in Jen's log.", "error")
+        flash("Could not remove the saved host; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -831,7 +861,7 @@ def wake_favorite(host_id):
     # the caller needs THAT subnet too: a favorite saved in A for a host that has moved to a subnet the caller
     # cannot see is theirs to list and edit, and not theirs to wake.
     if not row or not _can(row["subnet_id"]):
-        flash("Favorite not found.", "error")
+        flash("Saved host not found.", "error")
         return redirect(url_for("wol.index"))
     subnet_id, secureon, visible = wake_inputs(row, _current_subnet_for_mac(row["mac"]), _can)
     if not _can(subnet_id):

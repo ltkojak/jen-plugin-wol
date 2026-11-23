@@ -13,8 +13,10 @@ Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 
 import functools
 import importlib.util
+import json
 import os
 import pathlib
+import re
 import sys
 import types
 
@@ -415,7 +417,7 @@ def main():
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favorite(5)
     check(
-        "DELETE" not in fdb.kinds() and flashed[-1] == "Favorite not found.",
+        "DELETE" not in fdb.kinds() and flashed[-1] == "Saved host not found.",
         "delete_favorite: a favorite in subnet 2 reads as not found to a caller scoped to subnet 1",
     )
     fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": None}])
@@ -459,7 +461,7 @@ def main():
     p._get_db = lambda fdb=fdb: fdb
     p.delete_favorite(5)
     check(
-        "DELETE" not in fdb.kinds() and flashed[-1] == "Favorite not found.",
+        "DELETE" not in fdb.kinds() and flashed[-1] == "Saved host not found.",
         "delete_favorite: stored in B, host now in A - not found for the A caller, nothing deleted",
     )
     fdb = FakeDB([{"subnet_id": 2, "secureon": "aa:bb:cc:dd", "label": "x", "mac": "aa:bb:cc:dd:ee:01"}])
@@ -468,7 +470,7 @@ def main():
     p._last_sent.clear()
     p.wake_favorite(5)
     check(
-        sent == [] and flashed[-1] == "Favorite not found.",
+        sent == [] and flashed[-1] == "Saved host not found.",
         f"wake_favorite: stored in B, host now in A - not found for the A caller, nothing sent (got {sent})",
     )
     p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
@@ -1076,7 +1078,7 @@ def main():
     flashed.clear()
     p.add_favorite()
     check(
-        flashed and flashed[0].endswith("added to favorites.") and unchanged.rolled_back == 0,
+        flashed and flashed[0].endswith("added to saved hosts.") and unchanged.rolled_back == 0,
         f"add_favorite: a re-save of identical values (MySQL counts 0 changed rows) is still a success (flashed={flashed})",
     )
     # (c) a new MAC: the INSERT loses the race (1062) to a B-owned favorite - the winner is locked and judged, never overwritten
@@ -1110,7 +1112,7 @@ def main():
     check(
         mutations(lost_a) == ["INSERT", "UPDATE"]
         and lost_a.statements[-1][2][-1] == 1
-        and flashed[0].endswith("added to favorites."),
+        and flashed[0].endswith("added to saved hosts."),
         f"add_favorite: lost the INSERT race to a favorite in the caller's own subnet - updated under the owner predicate (got {mutations(lost_a)})",
     )
 
@@ -1164,7 +1166,7 @@ def main():
     flashed.clear()
     p.add_favorite()
     check(
-        audits_h == [] and flashed == ["That favorite is not yours to change."],
+        audits_h == [] and flashed == ["That saved host is not yours to change."],
         f"add_favorite: the healthy lookup refuses a hidden favorite with a sentence that says nothing about the MAC (got {flashed})",
     )
     # 1.1.5: the MAC the caller CAN see, with a hidden favorite, is told only that the favorite is not theirs; a MAC the caller
@@ -1198,8 +1200,8 @@ def main():
     )
     p._current_subnet_for_mac = lambda mac: 1
     check(
-        p.NOT_YOURS == "That favorite is not yours to change." and "MAC" not in p.NOT_YOURS,
-        "NOT_YOURS: exactly the favorite sentence, no claim about the MAC",
+        p.NOT_YOURS == "That saved host is not yours to change." and "MAC" not in p.NOT_YOURS,
+        "NOT_YOURS: exactly the saved-host sentence, no claim about the MAC",
     )
 
     # ── 1.1.5: a wake stamps last_woken_* only on a favorite the caller may see ──
@@ -1443,6 +1445,10 @@ def main():
     p._current_subnet_for_mac = lambda mac: 1
     p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
     api_120.subnet_context = stub_subnet_context
+    real_ip_present = p._ip_command_present
+    p._ip_command_present = lambda: (
+        True
+    )  # 1.2.1 (BH4): the box the harness runs on may have no `ip`; its own checks are below
     both_targets = [(("10.1.0.255", 9), 102), (("255.255.255.255", 9), 102)]
     limited_only = [(("255.255.255.255", 9), 102)]
     fav_row = {"mac": mac1, "subnet_id": 1, "secureon": None, "label": "nas"}
@@ -1652,10 +1658,217 @@ def main():
             f"wake_from_row: a favorite that was read supplies its 4-byte SecureOn to both targets (got {sorted(sendto)})",
         )
     finally:
+        p._ip_command_present = real_ip_present
         p.socket = real_socket_120
         p._send_wake = lambda mac, cidr, secureon: sent.append((mac, cidr, secureon))
         p.request = None
         sys.modules["flask"].request = None
+
+    # ── 1.2.1 (BH4): a host with no `ip` command cannot say which addresses it has ────────────────────────────────
+    asked_paths, asked_names = [], []
+    real_os, real_shutil = p._os, p.shutil
+
+    def host_with(paths=(), which=None):
+        """The real `_ip_command_present` on a host where only `paths` exist and `shutil.which("ip")` answers `which`."""
+        del asked_paths[:], asked_names[:]
+        p._os = types.SimpleNamespace(
+            path=types.SimpleNamespace(exists=lambda path: (asked_paths.append(path), path in paths)[1])
+        )
+        p.shutil = types.SimpleNamespace(which=lambda name: (asked_names.append(name), which)[1])
+        try:
+            return p._ip_command_present()
+        finally:
+            p._os, p.shutil = real_os, real_shutil
+
+    check(
+        host_with() is False and asked_paths == ["/usr/sbin/ip", "/sbin/ip", "/bin/ip"] and asked_names == ["ip"],
+        f"_ip_command_present (BH4): False when none of the three paths exists and `ip` is not on the PATH - the four candidates jen_host_ips tries (asked {asked_paths}, {asked_names})",
+    )
+    check(
+        all(host_with(paths={path}) is True for path in ("/usr/sbin/ip", "/sbin/ip", "/bin/ip")),
+        "_ip_command_present (BH4): True when any one of /usr/sbin/ip, /sbin/ip, /bin/ip exists",
+    )
+    check(
+        host_with(which="/opt/tools/ip") is True,
+        "_ip_command_present (BH4): True when `ip` is found on the PATH alone",
+    )
+    real_ip_present = p._ip_command_present
+    p._ip_command_present = lambda: False
+    try:
+        # what Jen's context lists on such a host: the hostname resolves to 127.0.1.1, so no address in the subnet
+        ctx_answer["value"] = jen_has()
+        reset()
+        check(
+            p._jen_on_link(1) is None and ctx_calls == [],
+            f"_jen_on_link (BH4): with no `ip` command the answer is None and the context is not asked (asked {ctx_calls})",
+        )
+        reset()
+        row_wake()
+        check(
+            flashes == [(f"Wake packet sent to {mac1}.", "success")]
+            and sent_audits() == [("WOL_SENT", mac1, "via=row subnet_id=1 on_link=unknown")]
+            and ctx_calls == [],
+            f"wake_from_row (BH4): with no `ip` command the plain sentence, audited on_link=unknown - 1.2.0 warned that Jen has no address in the subnet (got {flashes}, {sent_audits()})",
+        )
+        reset()
+        result = api_wake()
+        check(
+            result == {"ok": True, "mac": mac1, "on_link": None, "targets": ["10.1.0.255", "255.255.255.255"]},
+            f"_api_wake (BH4): with no `ip` command on_link is null (got {result})",
+        )
+        p._ip_command_present = lambda: True
+        answers = []
+        for answer in (jen_has("10.1.0.2"), jen_has(), None, RuntimeError("marker-ctx"), {"subnet_id": 1}):
+            ctx_answer["value"] = answer
+            answers.append(p._jen_on_link(1))
+        check(
+            answers == [True, False, None, None, None] and p._jen_on_link(None) is None,
+            f"_jen_on_link (BH4): with an `ip` command the answers are the ones of 1.2.0 - True, False, and None for a context that answered nothing, raised or lists no addresses (got {answers})",
+        )
+
+        # ── 1.2.1 (BH5): a subnet Jen is not configured for was answered as a success ──
+        unmapped = (
+            "Wake packet sent on Jen's own network only: subnet 7 is not one Jen is configured for.",
+            "warning",
+        )
+        check(
+            p.sent_message("host", mac1, 7, None, None) == unmapped,
+            f"sent_message (BH5): a subnet id with no broadcast is a warning that names the subnet - 1.2.0 answered a success (got {p.sent_message('host', mac1, 7, None, None)})",
+        )
+        check(
+            p.sent_message("host", mac1, 7, None, True) == unmapped
+            and p.sent_message("host", mac1, 7, "", False) == unmapped,
+            "sent_message (BH5): the same warning whatever the on-link answer - only the limited broadcast was targeted",
+        )
+        check(
+            p.sent_message("nas", mac1, 1, "10.1.0.255", True) == today
+            and p.sent_message("nas", mac1, 1, "10.1.0.255", None) == today
+            and p.sent_message("nas", mac1, 1, "10.1.0.255", False) == away
+            and p.sent_message("nas", mac1, None, None, None) == nowhere,
+            "sent_message (BH5): the three answers of 1.2.0 are as they were",
+        )
+        p._current_subnet_for_mac = lambda mac: 7  # a Kea subnet that is not in Jen's subnet map
+        ctx_answer["value"] = None  # what the context answers for a subnet Jen does not have
+        reset()
+        del sent[:]
+        row_wake()
+        check(
+            flashes == [unmapped]
+            and sent == [(mac1, None, None)]
+            and sent_audits() == [("WOL_SENT", mac1, "via=row subnet_id=7 on_link=unknown")],
+            f"wake_from_row (BH5): the MAC's subnet is not in Jen's map - sent with no subnet broadcast, and the warning says so (got {flashes}, {sent})",
+        )
+        reset()
+        result = api_wake()
+        check(
+            result == {"ok": True, "mac": mac1, "on_link": None, "targets": ["255.255.255.255"]},
+            f"_api_wake (BH5): the API answer is as it was - targets lists the one address (got {result})",
+        )
+    finally:
+        p._ip_command_present = real_ip_present
+        p._current_subnet_for_mac = lambda mac: 1
+        p.request = None
+        sys.modules["flask"].request = None
+
+    # ── 1.2.1 (V31): a saved host is called a saved host in what a person reads ───────────────────────────────────
+    page = pathlib.Path(ROOT, "templates", "wol", "index.html").read_text(encoding="utf-8")
+    source = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    manifest_text = pathlib.Path(ROOT, "manifest.json").read_text(encoding="utf-8")
+    readme = pathlib.Path(ROOT, "README.md").read_text(encoding="utf-8")
+    page_words = re.sub(r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", "", page, flags=re.S)
+    check(
+        not re.search("favorite", page_words, re.I) and page.count("url_for('wol.") == 3,
+        "index.html (V31): the word favorite is left only in the three endpoint names the forms post to",
+    )
+    flash_texts = [re.sub(r"\{[^}]*\}?", "", text) for text in re.findall(r'flash\(\s*f?"([^"]*)"', source)]
+    sentences = flash_texts + [
+        p.NOT_YOURS,
+        p.MAC_NOT_YOURS,
+        p.CHANGED_UNDERFOOT,
+        p.LOOKUP_REFUSAL,
+        p.WAKE_SETTINGS_REFUSAL,
+        p.WAKE_SETTINGS_API_ERROR,
+        p._VIEWER_MESSAGE,
+    ]
+    check(
+        len(flash_texts) >= 8 and not [text for text in sentences if re.search("favorite", text, re.I)],
+        f"plugin.py (V31): no flash sentence and no refusal says favorite ({len(sentences)} sentences read)",
+    )
+    card = p.investigation_card(
+        {"label": "Media PC", "subnet_id": 1, "secureon": None, "last_woken_at": None, "last_woken_by": None}
+    )
+    bare = p.investigation_card(
+        {"label": "", "subnet_id": 1, "secureon": None, "last_woken_at": None, "last_woken_by": None}
+    )
+    check(
+        card["summary"] == "A saved host (Media PC); never woken from Jen"
+        and bare["summary"] == "A saved host; never woken from Jen"
+        and {"label": "Saved host", "value": "Media PC"} in card["rows"]
+        and "favorite" not in str(card).lower() + str(bare).lower(),
+        f"investigation_card (V31): the card says saved host (got {card['summary']!r})",
+    )
+    check(
+        "favorite" not in json.loads(manifest_text)["description"].lower()
+        and "saved hosts" in json.loads(manifest_text)["description"],
+        "manifest.json (V31): the description under Settings, Plugins says saved hosts",
+    )
+    check(
+        not re.search("favorite", re.sub(r"`[^`]*`", "", readme), re.I),
+        "README.md (V31): favorite is left only inside code (route paths, audit actions, the audit detail)",
+    )
+    check(
+        '"WOL_ADD_FAVORITE"' in source
+        and '"WOL_DELETE_FAVORITE"' in source
+        and 'via="favorite"' in source
+        and "FROM wol_hosts" in source
+        and p.audit_detail("favorite", 1, True) == "via=favorite subnet_id=1 on_link=yes",
+        "plugin.py (V31): the audit actions, the audit detail via=favorite and the table keep their names",
+    )
+
+    # ── 1.2.1: the page (V52, addition 11 of the look over 7.2.0-beta.5) ───────────────────────────────────────────
+    check(
+        page.count("Save Host") == 4 and "Add Favorite" not in page,
+        f"index.html: the button is 'Save Host' in the header, the first steps and the dialog (got {page.count('Save Host')})",
+    )
+    first_run = page[
+        page.index('<div class="card first-run">') : page.index('{% else %}\n<div class="card wol-card-flush">')
+    ]
+    check(
+        page.index("{% if not rows %}\n{# v1.2.1") < page.index('<div class="card first-run">')
+        and "<h3>Getting started</h3>" in first_run
+        and first_run.count("<ol>") == 1
+        and first_run.count("<li>") == 2,
+        "index.html: with no saved host the page shows the card of first steps, two of them, in place of the empty table",
+    )
+    check(
+        "/settings/alerts" not in page and "register_alert" not in source,
+        "index.html: no alert step - Wake registers no alert type",
+    )
+    check(
+        'data-wol-open="wol-add-modal"' in first_run
+        and "Saving a host needs an admin." in first_run
+        and "Nothing is sent until someone presses Wake" in first_run,
+        "index.html: the first step carries Save Host (or says who may), the second says nothing is sent until someone presses Wake",
+    )
+    check(
+        'data-m="full"' not in page and "No favorites yet" not in page,
+        "index.html: no empty table row is left on the page (its text sat high on a phone)",
+    )
+    check(
+        '<div class="wol-head-text">' in page and ".wol-head-text{flex:1 1 320px;min-width:0}" in page,
+        "index.html: the header's text gives way before the button, so Save Host stays at the right at tablet width",
+    )
+    check(
+        "<th>Saved host</th>" in page and "<th>SecureOn password</th>" in page,
+        "index.html: the table's headings say Saved host and SecureOn password",
+    )
+    check(
+        "querySelectorAll('[data-wol-open]')" in page
+        and page.count('data-wol-open="wol-add-modal"') == 2
+        and "getElementById('wol-add-btn')" not in page,
+        "index.html: every button that opens the dialog is bound through data-wol-open",
+    )
+    check(not re.search(r"@media\s*\(", page), "index.html: no width rule without screen")
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

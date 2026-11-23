@@ -9,15 +9,25 @@
 .wol-card-flush{padding:0}
 .wol-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center}
 .wol-dialog{width:min(440px,94vw);max-height:90vh;overflow-y:auto}
+/* v1.2.1 - the header's text gives way before the button does, so the button stays at the right at tablet width */
+.wol-head-text{flex:1 1 320px;min-width:0}
+{% if not rows %}
+/* v1.2.1 - the card of first steps, shown in place of an empty table */
+.first-run h3{font-size:15px;margin-bottom:12px}
+.first-run ol{padding-left:22px}
+.first-run li{margin-bottom:10px;line-height:1.6}
+.first-run li:last-child{margin-bottom:0}
+.first-run .btn{margin-left:8px}
+{% endif %}
 </style>
 
 <div class="page-header flex items-center between wrap gap-3">
-    <div>
+    <div class="wol-head-text">
         <h1>{{ icon("zap", "ico-lg") }} Wake</h1>
-        <p>Wake-on-LAN favorites — send a magic packet to any host below, or use the "Wake" action on a Lease, Reservation, or Device row.</p>
+        <p>Send a Wake-on-LAN magic packet to a saved host below, or use the "Wake" action on a Lease, Reservation, or Device row.</p>
     </div>
     {% if is_admin %}
-    <button id="wol-add-btn" class="btn btn-primary">{{ icon("plus") }} Add Favorite</button>
+    <button type="button" id="wol-add-btn" class="btn btn-primary" data-wol-open="wol-add-modal">{{ icon("plus") }} Save Host</button>
     {% endif %}
 </div>
 
@@ -25,13 +35,26 @@
 <div class="alert alert-info">{{ icon("info") }} Wake & Actions targets IPv4 addresses only.</div>
 {% endif %}
 
+{% if not rows %}
+{# v1.2.1 - no saved host yet: the first steps, in place of an empty table #}
+<div class="card first-run">
+    <h3>Getting started</h3>
+    <ol>
+        <li>Save a host you wake often: its MAC address, a label, and its SecureOn password if its network card asks for one.
+            {% if is_admin %}<button type="button" class="btn btn-sm btn-primary" data-wol-open="wol-add-modal">{{ icon("plus") }} Save Host</button>
+            {% else %}<span class="muted">Saving a host needs an admin.</span>{% endif %}
+            A host does not have to be saved to be woken: the "Wake" action on any Lease, Reservation, or Device row sends the packet too.</li>
+        <li>Nothing is sent until someone presses Wake: Jen then sends the magic packet to the broadcast address of the host's subnet and to its own network, writes the wake to the audit log, and shows here, for a saved host, when it was last woken and by whom.</li>
+    </ol>
+</div>
+{% else %}
 <div class="card wol-card-flush">
 <div class="table-wrap">
 <table class="rowlist">
     <thead><tr>
-        <th>Favorite</th>
+        <th>Saved host</th>
         <th>Subnet</th>
-        <th>SecureOn</th>
+        <th>SecureOn password</th>
         <th>Last woken</th>
         <th></th>
     </tr></thead>
@@ -57,7 +80,7 @@
                     <button type="submit" class="btn btn-sm btn-primary" title="Wake" aria-label="Wake">{{ icon("zap") }}</button>
                 </form>
                 <form method="POST" action="{{ url_for('wol.delete_favorite', host_id=r.id) }}" class="contents"
-                      data-confirm="Remove {{ r.label or r.mac }} from favorites?">
+                      data-confirm="Remove {{ r.label or r.mac }} from saved hosts?">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn btn-sm btn-secondary bad" title="Delete" aria-label="Delete">{{ icon("trash") }}</button>
                 </form>
@@ -66,19 +89,17 @@
         </td>
     </tr>
     {% endfor %}
-    {% if not rows %}
-    <tr><td data-m="full" colspan="5" class="center muted">No favorites yet. {% if is_admin %}Add one above, or use the "Wake" action on any Lease, Reservation, or Device row.{% endif %}</td></tr>
-    {% endif %}
     </tbody>
 </table>
 </div>
 </div>
+{% endif %}
 
 {% if is_admin %}
 <div id="wol-add-modal" class="wol-modal">
 <div class="card wol-dialog">
     <div class="flex between items-center mb-3">
-        <h3>{{ icon("plus") }} Add Favorite</h3>
+        <h3>{{ icon("plus") }} Save Host</h3>
         <button id="wol-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
     </div>
     <form method="POST" action="{{ url_for('wol.add_favorite') }}" id="wol-add-form">
@@ -97,7 +118,7 @@
             <input type="text" name="label" id="wol-label" maxlength="100" autocomplete="off">
         </div>
         <div class="form-group">
-            <label>IP <span class="small muted">(optional — kept with the favorite; the subnet comes from the MAC)</span></label>
+            <label>IP <span class="small muted">(optional — kept with the saved host; the subnet comes from the MAC)</span></label>
             <input type="text" name="ip" id="wol-ip" class="mono" autocomplete="off">
         </div>
         <div class="form-group">
@@ -105,7 +126,7 @@
             <input type="text" name="secureon" class="mono" placeholder="aa:bb:cc:dd" autocomplete="off">
         </div>
         <div class="flex gap-2 mt-3">
-            <button type="submit" class="btn btn-primary">Add Favorite</button>
+            <button type="submit" class="btn btn-primary">Save Host</button>
             <button type="button" id="wol-add-cancel-btn" class="btn btn-secondary">Cancel</button>
         </div>
     </form>
@@ -119,7 +140,10 @@ function _wolModal(id, show) {
 }
 {% if is_admin %}
 var WOL_CANDIDATES = {{ candidates|tojson }};
-document.getElementById('wol-add-btn').addEventListener('click', function() { _wolModal('wol-add-modal', true); });
+// v1.2.1 - every button that opens the dialog names it in data-wol-open (the header's and the first steps')
+document.querySelectorAll('[data-wol-open]').forEach(function(btn) {
+    btn.addEventListener('click', function() { _wolModal(btn.getAttribute('data-wol-open'), true); });
+});
 document.getElementById('wol-add-close-btn').addEventListener('click', function() { _wolModal('wol-add-modal', false); });
 document.getElementById('wol-add-cancel-btn').addEventListener('click', function() { _wolModal('wol-add-modal', false); });
 document.getElementById('wol-add-modal').addEventListener('click', function(e) { if (e.target === this) _wolModal('wol-add-modal', false); });
